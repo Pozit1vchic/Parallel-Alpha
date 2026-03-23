@@ -1,0 +1,660 @@
+from __future__ import annotations
+
+import logging
+import math
+from collections import defaultdict
+from dataclasses import dataclass, field
+from enum import IntEnum
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, TypedDict
+
+import numpy as np
+import torch
+
+try:
+    import faiss
+except ImportError:
+    faiss = None
+
+NUM_KEYPOINTS = 17
+POSE_DIM = NUM_KEYPOINTS * 2
+EPS = 1e-8
+LEFT_SHOULDER, RIGHT_SHOULDER = 5, 6
+LEFT_HIP, RIGHT_HIP = 11, 12
+LEFT_KNEE, RIGHT_KNEE = 13, 14
+LEFT_ANKLE, RIGHT_ANKLE = 15, 16
+
+logger = logging.getLogger(__name__)
+
+
+class MotionType(IntEnum):
+    STANDING = 0
+    SITTING = 1
+    WALKING = 2
+    RUNNING = 3
+    OTHER = 4
+
+
+class MatchResult(TypedDict):
+    t1: float
+    t2: float
+    duration: float
+    similarity: float
+    motion_type: int
+    motion_label: str
+    v1_idx: int
+    v2_idx: int
+    frame_i: int
+    frame_j: int
+    energy: float
+    source: str
+
+
+@dataclass
+class MatcherConfig:
+    min_pose_confidence: float = 0.25
+    min_visible_keypoints: int = 6
+    min_frame_gap: int = 12
+    coarse_similarity_threshold: float = 0.45
+    final_similarity_threshold: float = 0.50
+    faiss_top_k_global: int = 300
+    faiss_top_k_bucket: int = 120
+    rrf_k: int = 60
+    max_candidates: int = 5000
+    max_candidates_for_dtw: int = 2000
+    use_semantic_buckets: bool = True
+    semantic_bucket_weight: float = 1.0
+    global_weight: float = 1.0
+    dtw_resample_len: int = 24
+    dtw_window_frames: int = 56
+    dtw_band_ratio: float = 0.15
+    soft_dtw_gamma: float = 0.05
+    dtw_batch_size: int = 2048
+    motion_energy_thresholds: Tuple[float, float] = (0.006, 0.035)
+    static_penalty: float = 0.70
+    dynamic_bonus: float = 1.08
+    nms_iou_threshold: float = 0.4
+    diversity_min_frame_gap: int = 48
+    max_results: int = 500
+    fallback_top_k: int = 100
+    neural_rerank_weight: float = 0.20
+    max_neural_candidates: int = 100
+    faiss_use_gpu: bool = True
+    chunk_size: int = 4000
+    log_every_stage: bool = True
+
+
+@dataclass
+class _PreparedData:
+    features: np.ndarray
+    norm_xy: np.ndarray
+    frame_indices: np.ndarray
+    track_ids: np.ndarray
+    motion_types: np.ndarray
+    motion_labels: np.ndarray
+    energy: np.ndarray
+    fps: float
+    track_rows: Dict[int, np.ndarray] = field(default_factory=dict)
+    track_positions: Dict[int, Dict[int, int]] = field(default_factory=dict)
+
+
+@dataclass
+class _Candidate:
+    i: int
+    j: int
+    base_similarity: float = 0.0
+    rrf_score: float = 0.0
+    dtw_similarity: float = 0.0
+    final_score: float = 0.0
+    a_start: int = 0
+    a_end: int = 0
+    b_start: int = 0
+    b_end: int = 0
+    source: str = "fused"
+
+
+class MotionMatcher2:
+    def __init__(
+        self,
+        config: Optional[MatcherConfig] = None,
+        device: Optional[str] = None,
+        neural_reranker: Optional[Callable[[List[_Candidate], _PreparedData], List[float]]] = None,
+    ) -> None:
+        self.config = config or MatcherConfig()
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.neural_reranker = neural_reranker
+
+    def match(self, pose_sequence: Any) -> List[MatchResult]:
+        """Run the full matching cascade and return formatted matches."""
+        data = self._preprocess(pose_sequence)
+        if data.features.shape[0] < 2:
+            return []
+
+        global_rank = self._faiss_rank_pairs(data.features, self.config.faiss_top_k_global)
+        bucket_rank: Dict[Tuple[int, int], Tuple[int, float]] = {}
+        if self.config.use_semantic_buckets:
+            bucket_rank = self._semantic_rank_pairs(data)
+
+        fused = self._rrf_fuse(global_rank, bucket_rank)
+        coarse = self._coarse_filter(fused, data)
+        temporal = self._temporal_rerank(coarse, data)
+        reranked = self._apply_neural_rerank(temporal, data)
+
+        if reranked:
+            results = self._nms_and_format(reranked, data, source="dtw")
+            if results:
+                return results
+
+        fallback = self._fallback_from_fused(fused, data)
+        return self._nms_and_format(fallback, data, source="fallback")
+
+    def _get_field(self, src: Any, names: Iterable[str], default: Any = None) -> Any:
+        for name in names:
+            if isinstance(src, dict) and name in src:
+                return src[name]
+            if hasattr(src, name):
+                return getattr(src, name)
+        return default
+
+    def _preprocess(self, pose_sequence: Any) -> _PreparedData:
+        """Extract, interpolate and normalize pose arrays from input sequence."""
+        raw = np.asarray(self._get_field(pose_sequence, ["norm_xy", "xy", "poses", "keypoints"], np.empty((0, 17, 2))))
+        conf = self._get_field(pose_sequence, ["conf", "confidence", "scores"], None)
+        conf_arr: np.ndarray
+
+        if raw.size == 0:
+            return _PreparedData(
+                features=np.empty((0, POSE_DIM), dtype=np.float32),
+                norm_xy=np.empty((0, NUM_KEYPOINTS, 2), dtype=np.float32),
+                frame_indices=np.empty((0,), dtype=np.int32),
+                track_ids=np.empty((0,), dtype=np.int32),
+                motion_types=np.empty((0,), dtype=np.int32),
+                motion_labels=np.empty((0,), dtype=object),
+                energy=np.empty((0,), dtype=np.float32),
+                fps=float(self._get_field(pose_sequence, ["fps"], 30.0)),
+            )
+
+        if raw.ndim == 2 and raw.shape[1] in (34, 51):
+            raw = raw.reshape(raw.shape[0], 17, raw.shape[1] // 17)
+        elif raw.ndim == 1 and raw.size in (34, 51):
+            raw = raw.reshape(1, 17, raw.size // 17)
+        elif raw.ndim == 2 and raw.shape[0] == 17 and raw.shape[1] in (2, 3):
+            raw = raw[None, ...]
+
+        if raw.ndim != 3:
+            raise ValueError(f"Unsupported pose tensor shape: {raw.shape}")
+
+        if raw.shape[-1] == 3:
+            xy = raw[..., :2].astype(np.float32)
+            conf_arr = raw[..., 2].astype(np.float32)
+        elif raw.shape[-1] == 2:
+            xy = raw[..., :2].astype(np.float32)
+            if conf is None:
+                conf_arr = np.ones((xy.shape[0], NUM_KEYPOINTS), dtype=np.float32)
+            else:
+                conf_arr = np.asarray(conf, dtype=np.float32)
+                if conf_arr.ndim == 1:
+                    conf_arr = np.tile(conf_arr[None, :], (xy.shape[0], 1))
+        else:
+            raise ValueError(f"Unsupported keypoint depth: {raw.shape[-1]}")
+
+        n = int(xy.shape[0])
+        frame_indices = np.asarray(self._get_field(pose_sequence, ["frame_indices", "frames"], np.arange(n)), dtype=np.int32)
+        track_ids = np.asarray(self._get_field(pose_sequence, ["track_ids", "track_id"], np.zeros(n)), dtype=np.int32)
+
+        if frame_indices.shape[0] != n:
+            frame_indices = np.arange(n, dtype=np.int32)
+        if track_ids.shape[0] != n:
+            track_ids = np.zeros(n, dtype=np.int32)
+
+        xy_i, conf_i, frames_i, tracks_i = self._interpolate_tracks(xy, conf_arr, frame_indices, track_ids)
+        norm_xy, visible = self._normalize_poses(xy_i, conf_i)
+        features = norm_xy.reshape(norm_xy.shape[0], POSE_DIM).astype(np.float32)
+        features[~np.repeat(visible, 2, axis=1)] = 0.0
+        norms = np.linalg.norm(features, axis=1, keepdims=True)
+        features = features / np.clip(norms, EPS, None)
+
+        energy = self._compute_energy(norm_xy, tracks_i)
+        motion_types = self._classify_motion_types(energy)
+        motion_labels = np.array([MotionType(mt).name.lower() for mt in motion_types], dtype=object)
+        track_rows = {int(t): np.where(tracks_i == t)[0] for t in np.unique(tracks_i)}
+        track_positions: Dict[int, Dict[int, int]] = {}
+        for t, rows in track_rows.items():
+            frame_map = {int(frames_i[r]): int(r) for r in rows}
+            track_positions[t] = frame_map
+
+        if self.config.log_every_stage:
+            logger.info("Preprocess complete: %d poses, %d tracks", len(norm_xy), len(track_rows))
+
+        return _PreparedData(
+            features=features,
+            norm_xy=norm_xy,
+            frame_indices=frames_i,
+            track_ids=tracks_i,
+            motion_types=motion_types,
+            motion_labels=motion_labels,
+            energy=energy,
+            fps=float(self._get_field(pose_sequence, ["fps"], 30.0)),
+            track_rows=track_rows,
+            track_positions=track_positions,
+        )
+
+    def _interpolate_tracks(
+        self,
+        xy: np.ndarray,
+        conf: np.ndarray,
+        frame_indices: np.ndarray,
+        track_ids: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        order = np.lexsort((frame_indices, track_ids))
+        xy = xy[order]
+        conf = conf[order]
+        frame_indices = frame_indices[order]
+        track_ids = track_ids[order]
+
+        out_xy: List[np.ndarray] = []
+        out_conf: List[np.ndarray] = []
+        out_frames: List[int] = []
+        out_tracks: List[int] = []
+
+        for tid in np.unique(track_ids):
+            rows = np.where(track_ids == tid)[0]
+            frames = frame_indices[rows]
+            poses = xy[rows]
+            cvals = conf[rows]
+
+            full_frames = np.arange(int(frames.min()), int(frames.max()) + 1, dtype=np.int32)
+            interp_pose = np.zeros((len(full_frames), NUM_KEYPOINTS, 2), dtype=np.float32)
+            interp_conf = np.zeros((len(full_frames), NUM_KEYPOINTS), dtype=np.float32)
+
+            for kp in range(NUM_KEYPOINTS):
+                valid = cvals[:, kp] > self.config.min_pose_confidence
+                xp = poses[:, kp, 0]
+                yp = poses[:, kp, 1]
+                cp = cvals[:, kp]
+                if valid.sum() >= 2:
+                    interp_pose[:, kp, 0] = np.interp(full_frames, frames[valid], xp[valid])
+                    interp_pose[:, kp, 1] = np.interp(full_frames, frames[valid], yp[valid])
+                    interp_conf[:, kp] = np.interp(full_frames, frames, cp)
+                elif len(frames) >= 1:
+                    interp_pose[:, kp, 0] = np.interp(full_frames, frames, xp)
+                    interp_pose[:, kp, 1] = np.interp(full_frames, frames, yp)
+                    interp_conf[:, kp] = np.interp(full_frames, frames, cp)
+
+            out_xy.append(interp_pose)
+            out_conf.append(interp_conf)
+            out_frames.extend(full_frames.tolist())
+            out_tracks.extend([int(tid)] * len(full_frames))
+
+        return (
+            np.concatenate(out_xy, axis=0),
+            np.concatenate(out_conf, axis=0),
+            np.asarray(out_frames, dtype=np.int32),
+            np.asarray(out_tracks, dtype=np.int32),
+        )
+
+    def _normalize_poses(self, xy: np.ndarray, conf: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Center around pelvis and scale by shoulder span for shape-invariant comparison."""
+        visible = conf >= self.config.min_pose_confidence
+        vis_count = visible.sum(axis=1)
+        valid_rows = vis_count >= self.config.min_visible_keypoints
+
+        pelvis = 0.5 * (xy[:, LEFT_HIP] + xy[:, RIGHT_HIP])
+        pelvis_valid = visible[:, LEFT_HIP] & visible[:, RIGHT_HIP]
+        if np.any(~pelvis_valid):
+            fallback_center = np.nanmean(np.where(visible[..., None], xy, np.nan), axis=1)
+            pelvis[~pelvis_valid] = fallback_center[~pelvis_valid]
+
+        shifted = xy - pelvis[:, None, :]
+        shoulder_span = np.linalg.norm(xy[:, LEFT_SHOULDER] - xy[:, RIGHT_SHOULDER], axis=1)
+        shoulder_valid = visible[:, LEFT_SHOULDER] & visible[:, RIGHT_SHOULDER]
+        if np.any(~shoulder_valid):
+            torso_span = np.linalg.norm(xy[:, LEFT_HIP] - xy[:, LEFT_SHOULDER], axis=1)
+            shoulder_span[~shoulder_valid] = torso_span[~shoulder_valid]
+
+        scale = np.clip(shoulder_span, EPS, None)
+        norm_xy = shifted / scale[:, None, None]
+        norm_xy[~visible[..., None].repeat(2, axis=2)] = 0.0
+        norm_xy[~valid_rows] = 0.0
+        return norm_xy.astype(np.float32), visible
+
+    def _faiss_rank_pairs(self, feats: np.ndarray, top_k: int) -> Dict[Tuple[int, int], Tuple[int, float]]:
+        """Rank nearest neighbors using FAISS with CPU fallback path."""
+        n = feats.shape[0]
+        if n == 0:
+            return {}
+        k = int(min(max(top_k, 1), n - 1)) if n > 1 else 0
+        if k <= 0:
+            return {}
+
+        x = feats.astype(np.float32, copy=False)
+        ranks: Dict[Tuple[int, int], Tuple[int, float]] = {}
+
+        if faiss is None:
+            if self.config.log_every_stage:
+                logger.warning("FAISS unavailable, using dense fallback")
+            for start in range(0, n, self.config.chunk_size):
+                end = min(n, start + self.config.chunk_size)
+                sim = x[start:end] @ x.T
+                row_idx = np.arange(start, end)[:, None]
+                sim[row_idx - start, row_idx] = -np.inf
+                idx = np.argpartition(-sim, kth=min(k, n - 1) - 1, axis=1)[:, :k]
+                vals = np.take_along_axis(sim, idx, axis=1)
+                order = np.argsort(-vals, axis=1)
+                idx = np.take_along_axis(idx, order, axis=1)
+                vals = np.take_along_axis(vals, order, axis=1)
+                for r in range(end - start):
+                    i = start + r
+                    for rank in range(k):
+                        j = int(idx[r, rank])
+                        pair = (i, j) if i < j else (j, i)
+                        prev = ranks.get(pair)
+                        new_rank = rank + 1
+                        score = float(vals[r, rank])
+                        if prev is None or new_rank < prev[0]:
+                            ranks[pair] = (new_rank, score)
+            return ranks
+
+        try:
+            index = faiss.IndexFlatIP(x.shape[1])
+            if self.config.faiss_use_gpu and torch.cuda.is_available():
+                try:
+                    res = faiss.StandardGpuResources()
+                    index = faiss.index_cpu_to_gpu(res, 0, index)
+                except Exception as exc:
+                    logger.warning("FAISS GPU init failed, fallback CPU: %s", exc)
+            index.add(x)
+            scores, ids = index.search(x, k + 1)
+            for i in range(n):
+                rank_idx = 0
+                for col in range(scores.shape[1]):
+                    j = int(ids[i, col])
+                    if j == i or j < 0:
+                        continue
+                    rank_idx += 1
+                    pair = (i, j) if i < j else (j, i)
+                    prev = ranks.get(pair)
+                    sc = float(scores[i, col])
+                    if prev is None or rank_idx < prev[0]:
+                        ranks[pair] = (rank_idx, sc)
+                    if rank_idx >= k:
+                        break
+        except Exception as exc:
+            logger.exception("FAISS search failed: %s", exc)
+            return self._faiss_rank_pairs(feats, top_k=top_k) if faiss is None else {}
+
+        return ranks
+
+    def _semantic_rank_pairs(self, data: _PreparedData) -> Dict[Tuple[int, int], Tuple[int, float]]:
+        grouped: Dict[int, List[int]] = defaultdict(list)
+        for i, mtype in enumerate(data.motion_types.tolist()):
+            grouped[int(mtype)].append(i)
+
+        result: Dict[Tuple[int, int], Tuple[int, float]] = {}
+        for bucket_rows in grouped.values():
+            if len(bucket_rows) < 2:
+                continue
+            sub_feats = data.features[np.asarray(bucket_rows, dtype=np.int32)]
+            sub_rank = self._faiss_rank_pairs(sub_feats, self.config.faiss_top_k_bucket)
+            for (a, b), (r, s) in sub_rank.items():
+                pair = (bucket_rows[a], bucket_rows[b])
+                prev = result.get(pair)
+                if prev is None or r < prev[0]:
+                    result[pair] = (r, s)
+        return result
+
+    def _rrf_fuse(
+        self,
+        global_rank: Dict[Tuple[int, int], Tuple[int, float]],
+        bucket_rank: Dict[Tuple[int, int], Tuple[int, float]],
+    ) -> List[_Candidate]:
+        pairs = set(global_rank.keys()) | set(bucket_rank.keys())
+        fused: List[_Candidate] = []
+        for pair in pairs:
+            g = global_rank.get(pair)
+            b = bucket_rank.get(pair)
+            rrf = 0.0
+            sims: List[float] = []
+            if g is not None:
+                rrf += self.config.global_weight / (self.config.rrf_k + g[0])
+                sims.append(g[1])
+            if b is not None:
+                rrf += self.config.semantic_bucket_weight / (self.config.rrf_k + b[0])
+                sims.append(b[1])
+            base_sim = float(max(sims) if sims else 0.0)
+            fused.append(_Candidate(i=pair[0], j=pair[1], base_similarity=base_sim, rrf_score=rrf, final_score=base_sim))
+
+        fused.sort(key=lambda c: c.rrf_score, reverse=True)
+        if self.config.log_every_stage:
+            logger.info("RRF fused candidates: %d", len(fused))
+        return fused
+
+    def _coarse_filter(self, candidates: List[_Candidate], data: _PreparedData) -> List[_Candidate]:
+        selected: List[_Candidate] = []
+        for c in candidates:
+            fi = int(data.frame_indices[c.i])
+            fj = int(data.frame_indices[c.j])
+            if abs(fi - fj) < self.config.min_frame_gap and data.track_ids[c.i] == data.track_ids[c.j]:
+                continue
+            sim = float(np.dot(data.features[c.i], data.features[c.j]))
+            c.base_similarity = sim
+            if sim >= self.config.coarse_similarity_threshold:
+                c.final_score = 0.6 * sim + 0.4 * c.rrf_score
+                selected.append(c)
+            if len(selected) >= self.config.max_candidates:
+                break
+
+        selected.sort(key=lambda c: c.final_score, reverse=True)
+        selected = selected[: self.config.max_candidates_for_dtw]
+        if self.config.log_every_stage:
+            logger.info("Coarse filter: %d -> %d", len(candidates), len(selected))
+        return selected
+
+    def _extract_window(self, idx: int, data: _PreparedData) -> Tuple[np.ndarray, int, int]:
+        track = int(data.track_ids[idx])
+        frame = int(data.frame_indices[idx])
+        half = self.config.dtw_window_frames // 2
+        start = frame - half
+        end = frame + half
+        seq_rows: List[int] = []
+        frame_map = data.track_positions.get(track, {})
+        for f in range(start, end + 1):
+            row = frame_map.get(f)
+            if row is not None:
+                seq_rows.append(row)
+
+        if not seq_rows:
+            return np.repeat(data.norm_xy[idx : idx + 1], self.config.dtw_resample_len, axis=0), frame, frame
+
+        seq = data.norm_xy[np.asarray(seq_rows, dtype=np.int32)]
+        if seq.shape[0] == self.config.dtw_resample_len:
+            return seq, int(data.frame_indices[seq_rows[0]]), int(data.frame_indices[seq_rows[-1]])
+
+        x_old = np.linspace(0.0, 1.0, seq.shape[0], dtype=np.float32)
+        x_new = np.linspace(0.0, 1.0, self.config.dtw_resample_len, dtype=np.float32)
+        out = np.zeros((self.config.dtw_resample_len, NUM_KEYPOINTS, 2), dtype=np.float32)
+        for kp in range(NUM_KEYPOINTS):
+            out[:, kp, 0] = np.interp(x_new, x_old, seq[:, kp, 0])
+            out[:, kp, 1] = np.interp(x_new, x_old, seq[:, kp, 1])
+        return out, int(data.frame_indices[seq_rows[0]]), int(data.frame_indices[seq_rows[-1]])
+
+    def _temporal_rerank(self, candidates: List[_Candidate], data: _PreparedData) -> List[_Candidate]:
+        if not candidates:
+            return []
+
+        device = torch.device(self.device if (self.device != "cuda" or torch.cuda.is_available()) else "cpu")
+        out: List[_Candidate] = []
+        batch_size = max(1, self.config.dtw_batch_size)
+
+        for start in range(0, len(candidates), batch_size):
+            batch = candidates[start : start + batch_size]
+            for cand in batch:
+                try:
+                    a_seq, a_start, a_end = self._extract_window(cand.i, data)
+                    b_seq, b_start, b_end = self._extract_window(cand.j, data)
+                    cand.a_start, cand.a_end = a_start, a_end
+                    cand.b_start, cand.b_end = b_start, b_end
+                    dtw_cost = self._soft_dtw_znorm_cost(a_seq, b_seq)
+                    dtw_sim = float(math.exp(-dtw_cost))
+                    cand.dtw_similarity = dtw_sim
+
+                    e = 0.5 * (float(data.energy[cand.i]) + float(data.energy[cand.j]))
+                    motion_factor = 1.0
+                    if e < self.config.motion_energy_thresholds[0]:
+                        motion_factor = self.config.static_penalty
+                    elif e > self.config.motion_energy_thresholds[1]:
+                        motion_factor = self.config.dynamic_bonus
+
+                    base = 0.35 * cand.base_similarity + 0.10 * cand.rrf_score + 0.55 * dtw_sim
+                    cand.final_score = base * motion_factor
+                    cand.source = "dtw"
+                    out.append(cand)
+                except Exception as exc:
+                    logger.warning("DTW rerank failed for pair (%d,%d): %s", cand.i, cand.j, exc)
+
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        out.sort(key=lambda c: c.final_score, reverse=True)
+        if self.config.log_every_stage:
+            logger.info("Temporal rerank output: %d", len(out))
+        return out
+
+    def _soft_dtw_znorm_cost(self, a: np.ndarray, b: np.ndarray) -> float:
+        """Compute z-normalized Soft-DTW cost with Sakoe-Chiba band."""
+        at = torch.as_tensor(a.reshape(a.shape[0], -1), dtype=torch.float32, device=self.device)
+        bt = torch.as_tensor(b.reshape(b.shape[0], -1), dtype=torch.float32, device=self.device)
+        at = (at - at.mean(dim=0, keepdim=True)) / (at.std(dim=0, keepdim=True) + EPS)
+        bt = (bt - bt.mean(dim=0, keepdim=True)) / (bt.std(dim=0, keepdim=True) + EPS)
+
+        dist = torch.cdist(at, bt, p=2.0) ** 2
+        n, m = dist.shape
+        gamma = max(self.config.soft_dtw_gamma, 1e-4)
+        band = max(1, int(math.ceil(max(n, m) * self.config.dtw_band_ratio)))
+
+        inf = torch.tensor(float("inf"), device=dist.device)
+        r = torch.full((n + 1, m + 1), inf, device=dist.device)
+        r[0, 0] = 0.0
+
+        for i in range(1, n + 1):
+            j_lo = max(1, i - band)
+            j_hi = min(m, i + band)
+            for j in range(j_lo, j_hi + 1):
+                prev = torch.stack([r[i - 1, j - 1], r[i - 1, j], r[i, j - 1]])
+                softmin = -gamma * torch.logsumexp(-prev / gamma, dim=0)
+                r[i, j] = dist[i - 1, j - 1] + softmin
+
+        cost = r[n, m] / float(n + m)
+        return float(cost.detach().cpu().item())
+
+    def _apply_neural_rerank(self, candidates: List[_Candidate], data: _PreparedData) -> List[_Candidate]:
+        if not candidates or self.neural_reranker is None:
+            return candidates
+
+        top_n = min(self.config.max_neural_candidates, len(candidates))
+        head = candidates[:top_n]
+        tail = candidates[top_n:]
+        try:
+            neural_scores = self.neural_reranker(head, data)
+            if len(neural_scores) != len(head):
+                logger.warning("Neural reranker returned %d scores for %d candidates", len(neural_scores), len(head))
+                return candidates
+            alpha = self.config.neural_rerank_weight
+            for c, ns in zip(head, neural_scores):
+                ns = float(np.clip(ns, 0.0, 1.0))
+                c.final_score = (1.0 - alpha) * c.final_score + alpha * ns
+                c.source = "dtw+neural"
+        except Exception as exc:
+            logger.warning("Neural rerank failed: %s", exc)
+            return candidates
+
+        merged = head + tail
+        merged.sort(key=lambda c: c.final_score, reverse=True)
+        return merged
+
+    def _fallback_from_fused(self, fused: List[_Candidate], data: _PreparedData) -> List[_Candidate]:
+        fallback: List[_Candidate] = []
+        for c in fused[: self.config.fallback_top_k]:
+            c.final_score = 0.8 * c.base_similarity + 0.2 * c.rrf_score
+            fi = int(data.frame_indices[c.i])
+            fj = int(data.frame_indices[c.j])
+            c.a_start = c.a_end = fi
+            c.b_start = c.b_end = fj
+            c.source = "fallback"
+            fallback.append(c)
+        return fallback
+
+    def _segment_iou(self, a0: int, a1: int, b0: int, b1: int) -> float:
+        inter = max(0, min(a1, b1) - max(a0, b0) + 1)
+        union = max(a1, b1) - min(a0, b0) + 1
+        return float(inter / max(union, 1))
+
+    def _nms_and_format(self, candidates: List[_Candidate], data: _PreparedData, source: str) -> List[MatchResult]:
+        if not candidates:
+            return []
+
+        kept: List[_Candidate] = []
+        for c in sorted(candidates, key=lambda x: x.final_score, reverse=True):
+            if c.final_score < self.config.final_similarity_threshold:
+                continue
+            suppress = False
+            for k in kept:
+                iou_a = self._segment_iou(c.a_start, c.a_end, k.a_start, k.a_end)
+                iou_b = self._segment_iou(c.b_start, c.b_end, k.b_start, k.b_end)
+                close_a = abs(c.a_start - k.a_start) < self.config.diversity_min_frame_gap
+                close_b = abs(c.b_start - k.b_start) < self.config.diversity_min_frame_gap
+                if (iou_a > self.config.nms_iou_threshold and iou_b > self.config.nms_iou_threshold) or (close_a and close_b):
+                    suppress = True
+                    break
+            if not suppress:
+                kept.append(c)
+            if len(kept) >= self.config.max_results:
+                break
+
+        out: List[MatchResult] = []
+        fps = max(data.fps, 1e-6)
+        for c in kept:
+            duration_frames = 0.5 * ((c.a_end - c.a_start + 1) + (c.b_end - c.b_start + 1))
+            out.append(
+                MatchResult(
+                    t1=float(data.frame_indices[c.i] / fps),
+                    t2=float(data.frame_indices[c.j] / fps),
+                    duration=float(duration_frames / fps),
+                    similarity=float(np.clip(c.final_score, 0.0, 1.0)),
+                    motion_type=int(data.motion_types[c.i]),
+                    motion_label=str(data.motion_labels[c.i]),
+                    v1_idx=int(data.track_ids[c.i]),
+                    v2_idx=int(data.track_ids[c.j]),
+                    frame_i=int(data.frame_indices[c.i]),
+                    frame_j=int(data.frame_indices[c.j]),
+                    energy=float(0.5 * (data.energy[c.i] + data.energy[c.j])),
+                    source=str(c.source or source),
+                )
+            )
+
+        if self.config.log_every_stage:
+            logger.info("NMS/format stage '%s': %d", source, len(out))
+        return out
+
+    def _compute_energy(self, norm_xy: np.ndarray, track_ids: np.ndarray) -> np.ndarray:
+        energy = np.zeros((norm_xy.shape[0],), dtype=np.float32)
+        for tid in np.unique(track_ids):
+            rows = np.where(track_ids == tid)[0]
+            if len(rows) < 2:
+                continue
+            seq = norm_xy[rows].reshape(len(rows), -1)
+            vel = np.linalg.norm(np.diff(seq, axis=0), axis=1)
+            local = np.concatenate([[vel[0]], vel])
+            energy[rows] = local.astype(np.float32)
+        return energy
+
+    def _classify_motion_types(self, energy: np.ndarray) -> np.ndarray:
+        low, high = self.config.motion_energy_thresholds
+        out = np.full((energy.shape[0],), MotionType.OTHER, dtype=np.int32)
+        out[energy < low * 0.5] = MotionType.SITTING
+        out[(energy >= low * 0.5) & (energy < low)] = MotionType.STANDING
+        out[(energy >= low) & (energy < high)] = MotionType.WALKING
+        out[energy >= high] = MotionType.RUNNING
+        return out
+
+
+MotionMatcher = MotionMatcher2

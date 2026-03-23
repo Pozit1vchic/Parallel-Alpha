@@ -1,0 +1,4 @@
+{
+    "python.analysis.extraPaths": ["./Parallel Alpha"],
+    "python.autoComplete.extraPaths": ["./Parallel Alpha"]
+}

@@ -1,0 +1,13 @@
+{
+    "min_conf": 0.45,
+    "min_valid_kps": 12,
+    "static_threshold": 0.008,
+    "sim_threshold": 0.92,
+    "window_sizes": [20, 40],
+    "stride": 4,
+    "min_time_gap": 2.0,
+    "nms_radius": 3.5,
+    "topk": 40,
+    "angle_weight": 2.0,
+    "coord_weight": 1.0
+}
