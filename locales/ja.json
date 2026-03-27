@@ -1,0 +1,10 @@
+{
+    "app": {"title": "Parallel Finder"},
+    "tabs": {"main": "メイン", "settings": "設定", "account": "アカウント", "preview": "プレビュー", "info": "情報"},
+    "main": {"load_video": "動画を選択", "load_folder": "フォルダ", "clear_queue": "クリア", "start": "分析を開始", "stop": "停止", "reset": "リセット"},
+    "metrics": {"frames": "フレーム", "patterns": "一致", "duration": "時間", "accuracy": "精度", "time_left": "残り時間", "batch": "バッチ"},
+    "settings": {"appearance": "外観", "background": "背景", "language_section": "言語", "behavior": "動作", "advanced": "詳細設定"},
+    "account": {"welcome": "ようこそ", "login_desc": "設定を同期するにはログインしてください", "signin_github": "GitHubでログイン", "signin_google": "Googleでログイン", "demo_info": "デモモード - 設定はローカルに保存されます", "logout": "ログアウト"},
+    "preview": {"scale": "拡大縮小", "reset_scale": "拡大縮小をリセット", "magnifier": "拡大鏡", "magnifier_toggle": "拡大鏡を有効にする", "quality": "品質", "view_mode": "表示モード", "overlay": "オーバーレイ", "normal": "通常", "motion_spectrogram": "モーションスペクトログラム", "heatmap": "ヒートマップ"},
+    "info": {"app_info": "アプリケーション情報", "links": "リンク", "technologies": "使用技術", "diagnostics": "診断", "author": "作者: {link}", "year": "年: {year}", "version": "バージョン: {version}", "description": "Parallel Finder — 動画内の繰り返し動作を見つけるためのプロフェッショナルツール", "documentation": "ドキュメント: {link}", "license": "ライセンス: {text}", "tech_stack": "Python 3.10 • PySide6 • YOLOv8-pose • FAISS • PyTorch", "copy_diagnostics": "診断情報をコピー", "diagnostics_copied": "診断情報をコピーしました", "diagnostics_copied_msg": "システム情報がコピーされました"}
+}

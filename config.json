@@ -1,0 +1,46 @@
+{
+  "ui": {
+    "language": "ru",
+    "theme": "dark",
+    "style": "comfortable",
+    "accent": "blue",
+    "font_family": "28 Days Later Cyr",
+    "scale": 100,
+    "density": "comfortable",
+    "background_type": "gradient",
+    "background_style": "subtle",
+    "background_intensity": 55,
+    "animation_speed": "slow",
+    "card_opacity": 95,
+    "animations_enabled": false,
+    "hover_effects_enabled": true,
+    "autosave": true
+  },
+  "preview": {
+    "scale": 1.0,
+    "quality": "low",
+    "view_mode": "fit",
+    "overlay_opacity": 40
+  },
+  "analysis": {
+    "threshold": 75,
+    "repeat_length": 3,
+    "min_gap": 5,
+    "quality": "balanced"
+  },
+  "language": "ru",
+  "theme": "dark",
+  "ui_style": "comfortable",
+  "accent_color": "blue",
+  "font_family": "28 Days Later Cyr",
+  "ui_scale": 100,
+  "density": "comfortable",
+  "background_type": "static",
+  "background_style": "dark_gradient",
+  "background_intensity": 55,
+  "animation_speed": 50,
+  "card_opacity": 95,
+  "animations_enabled": false,
+  "hover_effects": false,
+  "auto_save": false
+}

@@ -1,0 +1,10 @@
+{
+    "app": {"title": "Parallel Finder"},
+    "tabs": {"main": "Principal", "settings": "Setări", "account": "Cont", "preview": "Previzualizare", "info": "Informații"},
+    "main": {"load_video": "Încarcă video", "load_folder": "Dosar", "clear_queue": "Curăță", "start": "ÎNCEPE ANALIZA", "stop": "OPRIRE", "reset": "RESETARE"},
+    "metrics": {"frames": "Cadre", "patterns": "Potriviri", "duration": "Durată", "accuracy": "Precizie", "time_left": "Rămas", "batch": "Lot"},
+    "settings": {"appearance": "Aspect", "background": "Fundal", "language_section": "Limbă", "behavior": "Comportament", "advanced": "Avansat"},
+    "account": {"welcome": "Bun venit", "login_desc": "Conectați-vă pentru a sincroniza setările", "signin_github": "Autentificare cu GitHub", "signin_google": "Autentificare cu Google", "demo_info": "Mod demo - setările sunt salvate local", "logout": "Deconectare"},
+    "preview": {"scale": "Scală", "reset_scale": "Resetează scala", "magnifier": "Lupă", "magnifier_toggle": "Activează lupa", "quality": "Calitate", "view_mode": "Mod vizualizare", "overlay": "Suprapunere", "normal": "Normal", "motion_spectrogram": "Spectrogramă mișcare", "heatmap": "Hartă termică"},
+    "info": {"app_info": "Despre aplicație", "links": "Link-uri", "technologies": "Tehnologii", "diagnostics": "Diagnostic", "author": "Autor: {link}", "year": "Anul: {year}", "version": "Versiune: {version}", "description": "Parallel Finder — Instrument profesional pentru găsirea mișcărilor repetitive în video", "documentation": "Documentație: {link}", "license": "Licență: {text}", "tech_stack": "Python 3.10 • PySide6 • YOLOv8-pose • FAISS • PyTorch", "copy_diagnostics": "Copiază diagnostic", "diagnostics_copied": "Diagnostic copiat", "diagnostics_copied_msg": "Informațiile sistemului au fost copiate"}
+}

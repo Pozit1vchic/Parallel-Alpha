@@ -1,0 +1,10 @@
+{
+    "app": {"title": "Parallel Finder"},
+    "tabs": {"main": "Төп", "settings": "Көйләүләр", "account": "Аккаунт", "preview": "Күзаллау", "info": "Мәгълүмат"},
+    "main": {"load_video": "Видео сайлау", "load_folder": "Папка", "clear_queue": "Чистарту", "start": "АНАЛИЗНЫ БАШЛАУ", "stop": "ТУКТАТУ", "reset": "КӨЙЛӘҮЛӘРНЕ БАШЛАНГЫЧ ХАЛӘТКӘ КАЙТАРУ"},
+    "metrics": {"frames": "Кадрлар", "patterns": "Кабатлаулар", "duration": "Озынлык", "accuracy": "Охшашлык", "time_left": "Калган", "batch": "Төркем"},
+    "settings": {"appearance": "Тышкы күренеш", "background": "Фон", "language_section": "Тел", "behavior": "Тәртип", "advanced": "Киңәйтелгән"},
+    "account": {"welcome": "Рәхим итегез", "login_desc": "Көйләүләрне синхронлаштыру өчен керегез", "signin_github": "GitHub аша керү", "signin_google": "Google аша керү", "demo_info": "Демо-режим - көйләүләр локаль саклана", "logout": "Чыгу"},
+    "preview": {"scale": "Масштаб", "reset_scale": "Масштабны башлангыч халәткә кайтару", "magnifier": "Лупа", "magnifier_toggle": "Лупаны кушу", "quality": "Сыйфат", "view_mode": "Күрсәтү режимы", "overlay": "Өстәү", "normal": "Гадәти", "motion_spectrogram": "Хәрәкәт спектрограммасы", "heatmap": "Җылылык картасы"},
+    "info": {"app_info": "Программа турында", "links": "Сылтамалар", "technologies": "Технологияләр", "diagnostics": "Диагностика", "author": "Автор: {link}", "year": "Ел: {year}", "version": "Версия: {version}", "description": "Parallel Finder — видеода кабатланучы хәрәкәтләрне эзләү өчен профессиональ корал", "documentation": "Документация: {link}", "license": "Лицензия: {text}", "tech_stack": "Python 3.10 • PySide6 • YOLOv8-pose • FAISS • PyTorch", "copy_diagnostics": "Диагностиканы күчерү", "diagnostics_copied": "Диагностика күчерелде", "diagnostics_copied_msg": "Система мәгълүматы күчерелде"}
+}

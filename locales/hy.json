@@ -1,0 +1,10 @@
+{
+    "app": {"title": "Parallel Finder"},
+    "tabs": {"main": "Գլխավոր", "settings": "Կարգավորումներ", "account": "Հաշիվ", "preview": "Նախադիտում", "info": "Տեղեկություն"},
+    "main": {"load_video": "Բեռնել տեսանյութ", "load_folder": "Պանակ", "clear_queue": "Մաքրել", "start": "ՍԿՍԵԼ ՎԵՐԼՈՒԾՈՒԹՅՈՒՆԸ", "stop": "ԴԱԴԱՐԵՑՆԵԼ", "reset": "ՎԵՐԱԿԱՆԳՆԵԼ"},
+    "metrics": {"frames": "Կադրեր", "patterns": "Համընկնումներ", "duration": "Տևողություն", "accuracy": "Ճշգրտություն", "time_left": "Մնացել է", "batch": "Խմբաքանակ"},
+    "settings": {"appearance": "Արտաքին տեսք", "background": "Ֆոն", "language_section": "Լեզու", "behavior": "Վարքագիծ", "advanced": "Ընդլայնված"},
+    "account": {"welcome": "Բարի գալուստ", "login_desc": "Մուտք գործեք ձեր կարգավորումները սինխրոնիզացնելու համար", "signin_github": "Մուտք GitHub-ով", "signin_google": "Մուտք Google-ով", "demo_info": "Դեմո ռեժիմ - կարգավորումները պահպանվում են տեղում", "logout": "Ելք"},
+    "preview": {"scale": "Մասշտաբ", "reset_scale": "Վերականգնել մասշտաբը", "magnifier": "Խոշորացույց", "magnifier_toggle": "Միացնել խոշորացույցը", "quality": "Որակ", "view_mode": "Դիտման ռեժիմ", "overlay": "Ծածկույթ", "normal": "Սովորական", "motion_spectrogram": "Շարժման սպեկտրոգրամա", "heatmap": "Ջերմային քարտեզ"},
+    "info": {"app_info": "Ծրագրի մասին", "links": "Հղումներ", "technologies": "Տեխնոլոգիաներ", "diagnostics": "Ախտորոշում", "author": "Հեղինակ: {link}", "year": "Տարի: {year}", "version": "Տարբերակ: {version}", "description": "Parallel Finder — տեսանյութում կրկնվող շարժումներ գտնելու պրոֆեսիոնալ գործիք", "documentation": "Փաստաթղթեր: {link}", "license": "Արտոնագիր: {text}", "tech_stack": "Python 3.10 • PySide6 • YOLOv8-pose • FAISS • PyTorch", "copy_diagnostics": "Պատճենել ախտորոշումը", "diagnostics_copied": "Ախտորոշումը պատճենված է", "diagnostics_copied_msg": "Համակարգի տեղեկությունը պատճենված է"}
+}

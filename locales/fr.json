@@ -1,0 +1,10 @@
+{
+    "app": {"title": "Parallel Finder"},
+    "tabs": {"main": "Principal", "settings": "Paramètres", "account": "Compte", "preview": "Aperçu", "info": "Info"},
+    "main": {"load_video": "Charger vidéo", "load_folder": "Dossier", "clear_queue": "Effacer", "start": "DÉMARRER L'ANALYSE", "stop": "ARRÊT", "reset": "RÉINITIALISER"},
+    "metrics": {"frames": "Images", "patterns": "Correspondances", "duration": "Durée", "accuracy": "Précision", "time_left": "Restant", "batch": "Lot"},
+    "settings": {"appearance": "Apparence", "background": "Arrière-plan", "language_section": "Langue", "behavior": "Comportement", "advanced": "Avancé"},
+    "account": {"welcome": "Bienvenue", "login_desc": "Connectez-vous pour synchroniser vos paramètres", "signin_github": "Se connecter avec GitHub", "signin_google": "Se connecter avec Google", "demo_info": "Mode démo - paramètres sauvegardés localement", "logout": "Déconnexion"},
+    "preview": {"scale": "Échelle", "reset_scale": "Réinitialiser l'échelle", "magnifier": "Loupe", "magnifier_toggle": "Activer la loupe", "quality": "Qualité", "view_mode": "Mode d'affichage", "overlay": "Superposition", "normal": "Normal", "motion_spectrogram": "Spectrogramme de mouvement", "heatmap": "Carte thermique"},
+    "info": {"app_info": "À propos de l'application", "links": "Liens", "technologies": "Technologies", "diagnostics": "Diagnostic", "author": "Auteur: {link}", "year": "Année: {year}", "version": "Version: {version}", "description": "Parallel Finder — Outil professionnel pour trouver des mouvements répétitifs dans les vidéos", "documentation": "Documentation: {link}", "license": "Licence: {text}", "tech_stack": "Python 3.10 • PySide6 • YOLOv8-pose • FAISS • PyTorch", "copy_diagnostics": "Copier le diagnostic", "diagnostics_copied": "Diagnostic copié", "diagnostics_copied_msg": "Informations système copiées"}
+}

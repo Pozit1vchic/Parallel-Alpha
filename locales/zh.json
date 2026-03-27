@@ -1,0 +1,10 @@
+{
+    "app": {"title": "Parallel Finder"},
+    "tabs": {"main": "主页", "settings": "设置", "account": "账户", "preview": "预览", "info": "信息"},
+    "main": {"load_video": "选择视频", "load_folder": "文件夹", "clear_queue": "清空", "start": "开始分析", "stop": "停止", "reset": "重置"},
+    "metrics": {"frames": "帧数", "patterns": "匹配数", "duration": "时长", "accuracy": "相似度", "time_left": "剩余时间", "batch": "批次"},
+    "settings": {"appearance": "外观", "background": "背景", "language_section": "语言", "behavior": "行为", "advanced": "高级"},
+    "account": {"welcome": "欢迎", "login_desc": "登录以同步您的设置", "signin_github": "使用 GitHub 登录", "signin_google": "使用 Google 登录", "demo_info": "演示模式 - 设置保存在本地", "logout": "退出登录"},
+    "preview": {"scale": "缩放", "reset_scale": "重置缩放", "magnifier": "放大镜", "magnifier_toggle": "启用放大镜", "quality": "质量", "view_mode": "查看模式", "overlay": "叠加", "normal": "普通", "motion_spectrogram": "运动频谱图", "heatmap": "热力图"},
+    "info": {"app_info": "关于应用", "links": "链接", "technologies": "技术栈", "diagnostics": "诊断", "author": "作者: {link}", "year": "年份: {year}", "version": "版本: {version}", "description": "Parallel Finder — 专业的视频重复动作查找工具", "documentation": "文档: {link}", "license": "许可证: {text}", "tech_stack": "Python 3.10 • PySide6 • YOLOv8-pose • FAISS • PyTorch", "copy_diagnostics": "复制诊断信息", "diagnostics_copied": "诊断信息已复制", "diagnostics_copied_msg": "系统信息已复制到剪贴板"}
+}

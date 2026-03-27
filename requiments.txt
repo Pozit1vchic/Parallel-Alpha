@@ -1,0 +1,9 @@
+numpy
+opencv-python
+pillow
+ultralytics
+torch
+torchvision
+faiss-cpu
+PySide6
+psutil

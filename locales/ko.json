@@ -1,0 +1,10 @@
+{
+    "app": {"title": "Parallel Finder"},
+    "tabs": {"main": "메인", "settings": "설정", "account": "계정", "preview": "미리보기", "info": "정보"},
+    "main": {"load_video": "비디오 선택", "load_folder": "폴더", "clear_queue": "지우기", "start": "분석 시작", "stop": "중지", "reset": "초기화"},
+    "metrics": {"frames": "프레임", "patterns": "일치 항목", "duration": "시간", "accuracy": "정확도", "time_left": "남은 시간", "batch": "배치"},
+    "settings": {"appearance": "외관", "background": "배경", "language_section": "언어", "behavior": "동작", "advanced": "고급"},
+    "account": {"welcome": "환영합니다", "login_desc": "설정을 동기화하려면 로그인하세요", "signin_github": "GitHub으로 로그인", "signin_google": "Google로 로그인", "demo_info": "데모 모드 - 설정이 로컬에 저장됩니다", "logout": "로그아웃"},
+    "preview": {"scale": "확대/축소", "reset_scale": "확대/축소 초기화", "magnifier": "돋보기", "magnifier_toggle": "돋보기 활성화", "quality": "품질", "view_mode": "보기 모드", "overlay": "오버레이", "normal": "일반", "motion_spectrogram": "모션 스펙트로그램", "heatmap": "히트맵"},
+    "info": {"app_info": "애플리케이션 정보", "links": "링크", "technologies": "기술", "diagnostics": "진단", "author": "저자: {link}", "year": "년도: {year}", "version": "버전: {version}", "description": "Parallel Finder — 비디오에서 반복되는 동작을 찾기 위한 전문 도구", "documentation": "문서: {link}", "license": "라이선스: {text}", "tech_stack": "Python 3.10 • PySide6 • YOLOv8-pose • FAISS • PyTorch", "copy_diagnostics": "진단 정보 복사", "diagnostics_copied": "진단 정보가 복사되었습니다", "diagnostics_copied_msg": "시스템 정보가 복사되었습니다"}
+}

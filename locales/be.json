@@ -1,0 +1,10 @@
+{
+    "app": {"title": "Parallel Finder"},
+    "tabs": {"main": "Галоўная", "settings": "Налады", "account": "Акаўнт", "preview": "Прагляд", "info": "Інфармацыя"},
+    "main": {"load_video": "Выбраць відэа", "load_folder": "Папка", "clear_queue": "Ачысціць", "start": "ПАЧАЦЬ АНАЛІЗ", "stop": "СТОП", "reset": "СКІНУЦЬ"},
+    "metrics": {"frames": "Кадраў", "patterns": "Паўтораў", "duration": "Працягласць", "accuracy": "Падабенства", "time_left": "Засталося", "batch": "Партыя"},
+    "settings": {"appearance": "Знешні выгляд", "background": "Фон", "language_section": "Мова", "behavior": "Паводзіны", "advanced": "Пашыраныя"},
+    "account": {"welcome": "Вітаем", "login_desc": "Увайдзіце, каб сінхранізаваць налады", "signin_github": "Увайсці праз GitHub", "signin_google": "Увайсці праз Google", "demo_info": "Дэма-рэжым - налады захоўваюцца лакальна", "logout": "Выйсці"},
+    "preview": {"scale": "Маштаб", "reset_scale": "Скінуць маштаб", "magnifier": "Лупа", "magnifier_toggle": "Уключыць лупу", "quality": "Якасць", "view_mode": "Рэжым прагляду", "overlay": "Налажэнне", "normal": "Звычайны", "motion_spectrogram": "Спектраграма руху", "heatmap": "Цеплавая карта"},
+    "info": {"app_info": "Аб праграме", "links": "Спасылкі", "technologies": "Тэхналогіі", "diagnostics": "Дыягностыка", "author": "Аўтар: {link}", "year": "Год: {year}", "version": "Версія: {version}", "description": "Parallel Finder — прафесійны інструмент для пошуку паўтаральных рухаў у відэа", "documentation": "Дакументацыя: {link}", "license": "Ліцэнзія: {text}", "tech_stack": "Python 3.10 • PySide6 • YOLOv8-pose • FAISS • PyTorch", "copy_diagnostics": "Скапіраваць дыягностыку", "diagnostics_copied": "Дыягностыка скапіравана", "diagnostics_copied_msg": "Інфармацыя пра сістэму скапіравана"}
+}

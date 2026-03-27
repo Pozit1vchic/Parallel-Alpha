@@ -1,0 +1,10 @@
+{
+    "app": {"title": "Parallel Finder"},
+    "tabs": {"main": "მთავარი", "settings": "პარამეტრები", "account": "ანგარიში", "preview": "გადახედვა", "info": "ინფორმაცია"},
+    "main": {"load_video": "ვიდეოს არჩევა", "load_folder": "საქაღალდე", "clear_queue": "გასუფთავება", "start": "ანალიზის დაწყება", "stop": "გაჩერება", "reset": "გადატვირთვა"},
+    "metrics": {"frames": "კადრები", "patterns": "დამთხვევები", "duration": "ხანგრძლივობა", "accuracy": "სიზუსტე", "time_left": "დარჩენილი", "batch": "პარტია"},
+    "settings": {"appearance": "გარეგნობა", "background": "ფონი", "language_section": "ენა", "behavior": "ქცევა", "advanced": "გაფართოებული"},
+    "account": {"welcome": "მოგესალმებით", "login_desc": "შედით თქვენი პარამეტრების სინქრონიზაციისთვის", "signin_github": "GitHub-ით შესვლა", "signin_google": "Google-ით შესვლა", "demo_info": "დემო რეჟიმი - პარამეტრები ინახება ლოკალურად", "logout": "გამოსვლა"},
+    "preview": {"scale": "მასშტაბი", "reset_scale": "მასშტაბის გადატვირთვა", "magnifier": "გამადიდებელი", "magnifier_toggle": "გამადიდებლის ჩართვა", "quality": "ხარისხი", "view_mode": "ნახვის რეჟიმი", "overlay": "გადაფარვა", "normal": "ჩვეულებრივი", "motion_spectrogram": "მოძრაობის სპექტროგრამა", "heatmap": "თერმული რუკა"},
+    "info": {"app_info": "აპლიკაციის შესახებ", "links": "ბმულები", "technologies": "ტექნოლოგიები", "diagnostics": "დიაგნოსტიკა", "author": "ავტორი: {link}", "year": "წელი: {year}", "version": "ვერსია: {version}", "description": "Parallel Finder — ვიდეოში განმეორებადი მოძრაობების მოსაძებნი პროფესიონალური ინსტრუმენტი", "documentation": "დოკუმენტაცია: {link}", "license": "ლიცენზია: {text}", "tech_stack": "Python 3.10 • PySide6 • YOLOv8-pose • FAISS • PyTorch", "copy_diagnostics": "დიაგნოსტიკის კოპირება", "diagnostics_copied": "დიაგნოსტიკა კოპირებულია", "diagnostics_copied_msg": "სისტემის ინფორმაცია კოპირებულია"}
+}

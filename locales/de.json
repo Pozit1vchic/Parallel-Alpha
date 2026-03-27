@@ -1,0 +1,10 @@
+{
+    "app": {"title": "Parallel Finder"},
+    "tabs": {"main": "Hauptseite", "settings": "Einstellungen", "account": "Konto", "preview": "Vorschau", "info": "Info"},
+    "main": {"load_video": "Video auswählen", "load_folder": "Ordner", "clear_queue": "Löschen", "start": "ANALYSE STARTEN", "stop": "STOPP", "reset": "ZURÜCKSETZEN"},
+    "metrics": {"frames": "Bilder", "patterns": "Übereinstimmungen", "duration": "Dauer", "accuracy": "Genauigkeit", "time_left": "Verbleibend", "batch": "Batch"},
+    "settings": {"appearance": "Erscheinungsbild", "background": "Hintergrund", "language_section": "Sprache", "behavior": "Verhalten", "advanced": "Erweitert"},
+    "account": {"welcome": "Willkommen", "login_desc": "Melden Sie sich an, um Ihre Einstellungen zu synchronisieren", "signin_github": "Mit GitHub anmelden", "signin_google": "Mit Google anmelden", "demo_info": "Demo-Modus - Einstellungen werden lokal gespeichert", "logout": "Abmelden"},
+    "preview": {"scale": "Skalierung", "reset_scale": "Skalierung zurücksetzen", "magnifier": "Lupe", "magnifier_toggle": "Lupe aktivieren", "quality": "Qualität", "view_mode": "Ansichtsmodus", "overlay": "Überlagerung", "normal": "Normal", "motion_spectrogram": "Bewegungsspektrogramm", "heatmap": "Heatmap"},
+    "info": {"app_info": "Über die Anwendung", "links": "Links", "technologies": "Technologien", "diagnostics": "Diagnose", "author": "Autor: {link}", "year": "Jahr: {year}", "version": "Version: {version}", "description": "Parallel Finder — Professionelles Werkzeug zum Auffinden sich wiederholender Bewegungen in Videos", "documentation": "Dokumentation: {link}", "license": "Lizenz: {text}", "tech_stack": "Python 3.10 • PySide6 • YOLOv8-pose • FAISS • PyTorch", "copy_diagnostics": "Diagnose kopieren", "diagnostics_copied": "Diagnose kopiert", "diagnostics_copied_msg": "Systeminformationen wurden kopiert"}
+}
