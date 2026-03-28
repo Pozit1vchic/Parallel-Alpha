@@ -21,6 +21,15 @@ import psutil
 from core.engine import YoloEngine
 from core.project import ProjectManager
 
+# Попытка импорта для трея
+try:
+    import pystray
+    from PIL import Image as PILImage
+    TRAY_AVAILABLE = True
+except ImportError:
+    TRAY_AVAILABLE = False
+    print("Для трея установи: pip install pystray")
+
 warnings.filterwarnings('ignore')
 
 if torch.cuda.is_available():
@@ -193,8 +202,18 @@ class ParallelFinderApp:
         self.colors = THEMES['dark']
         self.root.configure(bg=self.colors['bg'])
         
+        # Иконка окна
+        try:
+            icon_path = os.path.join(os.path.dirname(__file__), "..", "icons", "icon.ico")
+            if os.path.exists(icon_path):
+                self.root.iconbitmap(icon_path)
+        except:
+            pass
+        
+        # Настройки
         self.threshold = tk.IntVar(value=70)
         self.scene_interval = tk.IntVar(value=3)
+        self.match_gap = tk.IntVar(value=4)
         self.motion_length = tk.DoubleVar(value=2.0)
         self.frame_skip = tk.IntVar(value=2)
         self.quality = tk.StringVar(value='Средне')
@@ -227,25 +246,70 @@ class ParallelFinderApp:
 
         self.setup_ui()
         self.setup_hotkeys()
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
+        # Трей (сворачивание в системный лоток)
+        self._create_tray_icon()
+        self.root.protocol("WM_DELETE_WINDOW", self._hide_to_tray)
         
         # Автонастройка под железо
         self._auto_tune_hardware()
 
+    def _create_tray_icon(self):
+        """Создание иконки в системном лотке (трее)"""
+        if not TRAY_AVAILABLE:
+            return
+        
+        try:
+            tray_path = os.path.join(os.path.dirname(__file__), "..", "icons", "tray_icon.png")
+            if os.path.exists(tray_path):
+                image = PILImage.open(tray_path)
+            else:
+                image = PILImage.new('RGB', (64, 64), color='#3b82f6')
+            
+            menu = pystray.Menu(
+                pystray.MenuItem("Показать", self._show_window),
+                pystray.MenuItem("Скрыть", self._hide_window),
+                pystray.MenuItem("Выход", self._quit_app)
+            )
+            
+            self.tray_icon = pystray.Icon("parallel_finder", image, "Parallel Finder", menu)
+            self.tray_icon.run_detached()
+        except Exception as e:
+            print(f"Ошибка создания трея: {e}")
+
+    def _show_window(self):
+        """Показать окно"""
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def _hide_window(self):
+        """Скрыть окно в трей"""
+        self.root.withdraw()
+
+    def _hide_to_tray(self):
+        """Свернуть в трей вместо закрытия"""
+        self._hide_window()
+
+    def _quit_app(self):
+        """Выход из приложения"""
+        if hasattr(self, 'tray_icon'):
+            self.tray_icon.stop()
+        self.root.quit()
+        self.root.destroy()
+
     def _auto_tune_hardware(self):
         """Автоматическая настройка параметров под железо пользователя"""
         print("\n" + "="*50)
-        print("🔧 АВТОНАСТРОЙКА ПОД ЖЕЛЕЗО")
+        print("АВТОНАСТРОЙКА ПОД ЖЕЛЕЗО")
         print("="*50)
         
-        # Определяем CPU
         cpu_cores = psutil.cpu_count(logical=True)
         cpu_name = platform.processor()
         ram_gb = psutil.virtual_memory().total / 1e9
-        print(f"💻 CPU: {cpu_name or 'Unknown'} ({cpu_cores} ядер)")
-        print(f"💾 RAM: {ram_gb:.1f} GB")
+        print(f"CPU: {cpu_name or 'Unknown'} ({cpu_cores} ядер)")
+        print(f"RAM: {ram_gb:.1f} GB")
         
-        # Определяем GPU
         gpu_available = torch.cuda.is_available()
         vram_gb = 0
         gpu_name = "Не обнаружен"
@@ -254,16 +318,13 @@ class ParallelFinderApp:
             try:
                 gpu_name = torch.cuda.get_device_name(0)
                 vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-                print(f"🖥️ GPU: {gpu_name}")
-                print(f"💾 VRAM: {vram_gb:.1f} GB")
+                print(f"GPU: {gpu_name}")
+                print(f"VRAM: {vram_gb:.1f} GB")
             except Exception as e:
-                print(f"⚠️ Ошибка определения GPU: {e}")
+                print(f"Ошибка определения GPU: {e}")
                 gpu_available = False
         
-        # ========== РЕКОМЕНДУЕМЫЕ НАСТРОЙКИ ==========
-        # Словарь конфигураций для разных типов железа
         configs = {
-            # Слабые GPU (GTX 1050, 950, 2-4GB)
             'weak_gpu': {
                 'batch': 8,
                 'chunk': 1500,
@@ -272,7 +333,6 @@ class ParallelFinderApp:
                 'total_matches': 5000000,
                 'desc': 'Эконом (для слабых GPU, 2-4GB VRAM)'
             },
-            # Средние GPU (GTX 1060, 1650, 4-6GB)
             'medium_gpu': {
                 'batch': 24,
                 'chunk': 2500,
@@ -281,7 +341,6 @@ class ParallelFinderApp:
                 'total_matches': 15000000,
                 'desc': 'Средний (GTX 1060/1660, 4-6GB VRAM)'
             },
-            # Хорошие GPU (RTX 2060, 3060, 8GB)
             'good_gpu': {
                 'batch': 48,
                 'chunk': 4000,
@@ -290,7 +349,6 @@ class ParallelFinderApp:
                 'total_matches': 20000000,
                 'desc': 'Высокий (RTX 2060/3060, 8GB VRAM)'
             },
-            # Мощные GPU (RTX 3070+, 12GB+)
             'powerful_gpu': {
                 'batch': 64,
                 'chunk': 5000,
@@ -299,7 +357,6 @@ class ParallelFinderApp:
                 'total_matches': 30000000,
                 'desc': 'Максимум (RTX 3070+, 12GB+ VRAM)'
             },
-            # CPU режим (без GPU)
             'cpu_mode': {
                 'batch': 8,
                 'chunk': 1500,
@@ -310,26 +367,24 @@ class ParallelFinderApp:
             }
         }
         
-        # Выбираем конфигурацию
         selected_config = None
         
         if not gpu_available:
             selected_config = configs['cpu_mode']
-            print(f"\n⚡ Выбран режим: {selected_config['desc']}")
+            print(f"\nВыбран режим: {selected_config['desc']}")
         elif vram_gb < 4:
             selected_config = configs['weak_gpu']
-            print(f"\n⚡ Выбран режим: {selected_config['desc']}")
+            print(f"\nВыбран режим: {selected_config['desc']}")
         elif vram_gb < 8:
             selected_config = configs['medium_gpu']
-            print(f"\n⚡ Выбран режим: {selected_config['desc']}")
+            print(f"\nВыбран режим: {selected_config['desc']}")
         elif vram_gb < 12:
             selected_config = configs['good_gpu']
-            print(f"\n⚡ Выбран режим: {selected_config['desc']}")
+            print(f"\nВыбран режим: {selected_config['desc']}")
         else:
             selected_config = configs['powerful_gpu']
-            print(f"\n⚡ Выбран режим: {selected_config['desc']}")
+            print(f"\nВыбран режим: {selected_config['desc']}")
         
-        # Применяем настройки
         self.BATCH_SIZE = selected_config['batch']
         self.CHUNK_SIZE = selected_config['chunk']
         self.quality.set(selected_config['quality'])
@@ -344,7 +399,7 @@ class ParallelFinderApp:
         print("="*50 + "\n")
 
     def on_closing(self):
-        self.root.destroy()
+        self._quit_app()
 
     def setup_ui(self):
         main = tk.Frame(self.root, bg=self.colors['bg'])
@@ -443,14 +498,21 @@ class ParallelFinderApp:
         container = tk.Frame(parent, bg=self.colors['card'])
         container.pack(fill=tk.BOTH, expand=True)
         
-        canvas = tk.Canvas(container, bg=self.colors['card'], highlightthickness=0)
+        canvas = tk.Canvas(container, bg=self.colors['card'], highlightthickness=0, bd=0)
         scrollbar = tk.Scrollbar(container, orient=tk.VERTICAL, command=canvas.yview)
         scrollable = tk.Frame(canvas, bg=self.colors['card'])
+
         scrollable.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=scrollable, anchor="nw")
+        window_id = canvas.create_window((0, 0), window=scrollable, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
+
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def _resize_scrollable(event):
+            canvas.itemconfigure(window_id, width=event.width - scrollbar.winfo_width())
+
+        canvas.bind("<Configure>", _resize_scrollable)
         
         card = scrollable
         
@@ -471,15 +533,17 @@ class ParallelFinderApp:
         tk.Label(q_frame, text="Качество", font=('Inter', 10),
                  bg=self.colors['card'], fg=self.colors['text_secondary']).pack(anchor='w')
         self.quality_combo = ttk.Combobox(q_frame, textvariable=self.quality,
-                                           values=['Быстро', 'Средне', 'Макс'],
-                                           font=('Inter', 10), state='readonly')
+                                          values=['Быстро', 'Средне', 'Макс'],
+                                          font=('Inter', 10), state='readonly')
         self.quality_combo.pack(fill=tk.X, pady=(4, 0))
         
         g2 = tk.Frame(card, bg=self.colors['card'])
         g2.pack(fill=tk.X, padx=20, pady=(0, 20))
+        
         tk.Label(g2, text="Временные параметры", font=('Inter', 12, 'bold'),
                  bg=self.colors['card'], fg=self.colors['text']).pack(anchor='w', pady=(0, 10))
-        self.add_setting_row(g2, "Интервал сцен", self.scene_interval, 1, 30, 3, "сек")
+        self.add_setting_row(g2, "Интервал сцен (длительность)", self.scene_interval, 1, 30, 3, "сек")
+        self.add_setting_row(g2, "Мин. интервал между повторами", self.match_gap, 1, 30, 4, "сек")
         
         g3 = tk.Frame(card, bg=self.colors['card'])
         g3.pack(fill=tk.X, padx=20, pady=(0, 20))
@@ -501,11 +565,11 @@ class ParallelFinderApp:
         btn_frame.pack(fill=tk.X, padx=20, pady=(0, 20))
         
         self.start_btn = GlowButton(btn_frame, "Старт", self.start_analysis,
-                                      self.colors['success'], '#2ecc71', width=400, height=42)
+                                    self.colors['success'], '#2ecc71', width=400, height=42)
         self.start_btn.pack(fill=tk.X, pady=(0, 8))
         
         self.stop_btn = GlowButton(btn_frame, "Стоп", self.stop_analysis,
-                                     self.colors['error'], '#ff6b6b', width=400, height=38)
+                                   self.colors['error'], '#ff6b6b', width=400, height=38)
         self.stop_btn.pack(fill=tk.X)
 
     def add_setting_row(self, parent, label, var, from_, to, default, unit, step=1):
@@ -964,7 +1028,6 @@ class ParallelFinderApp:
                 i_local, j = indices[k]
                 i = start + i_local
                 
-                # Добавляем только если i < j (убираем дубликаты A↔B и B↔A)
                 if i < j:
                     matches.append({
                         'm1_idx': i, 'm2_idx': j,
@@ -999,7 +1062,6 @@ class ParallelFinderApp:
         if not matches:
             return []
         
-        # ========== УМНЫЙ ФИЛЬТР МУСОРА ==========
         matches.sort(key=lambda x: x['sim'], reverse=True)
         
         good_matches = [m for m in matches if m['sim'] >= 0.85]
@@ -1008,14 +1070,13 @@ class ParallelFinderApp:
         junk_limit = int(len(junk_matches) * 0.2)
         selected = good_matches + junk_matches[:junk_limit]
         
-        print(f"✅ Хороших (≥0.85): {len(good_matches)}")
-        print(f"🗑️ Мусора (<0.85): {len(junk_matches)} (взято {junk_limit})")
-        print(f"📊 Всего на дедупликацию: {len(selected)}")
+        print(f"Хороших (>=0.85): {len(good_matches)}")
+        print(f"Мусора (<0.85): {len(junk_matches)} (взято {junk_limit})")
+        print(f"Всего на дедупликацию: {len(selected)}")
         
-        # Дедупликация
         used_intervals = []
         unique = []
-        min_unique_gap = self.scene_interval.get()  # интервал между уникальными повторами
+        min_unique_gap = self.match_gap.get()
         
         for m in selected:
             is_overlap = False
@@ -1023,7 +1084,6 @@ class ParallelFinderApp:
             t2 = m['t2']
             
             for used in used_intervals:
-                # Если хотя бы один из моментов слишком близок к уже найденному
                 if (abs(t1 - used[0]) < min_unique_gap or abs(t2 - used[1]) < min_unique_gap):
                     is_overlap = True
                     break
@@ -1035,7 +1095,7 @@ class ParallelFinderApp:
             if len(unique) >= 1000:
                 break
         
-        print(f"🎯 Уникальных после дедупликации: {len(unique)}")
+        print(f"Уникальных после дедупликации: {len(unique)}")
         return unique[:1000]
 
     def _on_analysis_complete(self):
