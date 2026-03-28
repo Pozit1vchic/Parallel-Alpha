@@ -1015,6 +1015,7 @@ class ParallelFinderApp:
         # Дедупликация
         used_intervals = []
         unique = []
+        min_unique_gap = self.scene_interval.get()  # интервал между уникальными повторами
         
         for m in selected:
             is_overlap = False
@@ -1022,7 +1023,8 @@ class ParallelFinderApp:
             t2 = m['t2']
             
             for used in used_intervals:
-                if (abs(t1 - used[0]) < 1.5 or abs(t2 - used[1]) < 1.5):
+                # Если хотя бы один из моментов слишком близок к уже найденному
+                if (abs(t1 - used[0]) < min_unique_gap or abs(t2 - used[1]) < min_unique_gap):
                     is_overlap = True
                     break
             
