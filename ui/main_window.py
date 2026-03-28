@@ -964,18 +964,20 @@ class ParallelFinderApp:
                 i_local, j = indices[k]
                 i = start + i_local
                 
-                matches.append({
-                    'm1_idx': i, 'm2_idx': j,
-                    't1': self.poses_meta[i]['t'],
-                    't2': self.poses_meta[j]['t'],
-                    'f1': self.poses_meta[i]['f'],
-                    'f2': self.poses_meta[j]['f'],
-                    'v1_idx': self.poses_meta[i].get('video_idx', 0),
-                    'v2_idx': self.poses_meta[j].get('video_idx', 0),
-                    'sim': float(scores[k]),
-                    'direction': self.poses_meta[i].get('dir', 'forward')
-                })
-                chunk_matches += 1
+                # Добавляем только если i < j (убираем дубликаты A↔B и B↔A)
+                if i < j:
+                    matches.append({
+                        'm1_idx': i, 'm2_idx': j,
+                        't1': self.poses_meta[i]['t'],
+                        't2': self.poses_meta[j]['t'],
+                        'f1': self.poses_meta[i]['f'],
+                        'f2': self.poses_meta[j]['f'],
+                        'v1_idx': self.poses_meta[i].get('video_idx', 0),
+                        'v2_idx': self.poses_meta[j].get('video_idx', 0),
+                        'sim': float(scores[k]),
+                        'direction': self.poses_meta[i].get('dir', 'forward')
+                    })
+                    chunk_matches += 1
                 
                 if chunk_matches >= max_matches_per_chunk:
                     print(f"Лимит чанка {max_matches_per_chunk}, переход к следующему")
