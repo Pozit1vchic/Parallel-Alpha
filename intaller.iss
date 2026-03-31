@@ -1,6 +1,6 @@
 #define MyAppName "ParallelFinder"
-#define MyAppVersion "1.0"
-#define MyAppPublisher "OpenSource"
+#define MyAppVersion "12.5 Alpha"
+#define MyAppPublisher "Pozit1vchic"
 
 [Setup]
 AppName={#MyAppName}
@@ -26,6 +26,7 @@ Source: "config.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "install_deps.bat"; DestDir: "{app}"
 Source: "post_install.bat"; DestDir: "{app}"
 Source: "run_app.vbs"; DestDir: "{app}"
+Source: "python-3.10.0-amd64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
 
 Source: "core\*"; DestDir: "{app}\core"; Flags: recursesubdirs createallsubdirs
 Source: "ui\*"; DestDir: "{app}\ui"; Flags: recursesubdirs createallsubdirs
@@ -47,6 +48,79 @@ Filename: "{app}\post_install.bat"; Parameters: "{code:GetInstallMode} ""{code:G
 var
   InstallModePage: TInputOptionWizardPage;
   LibsPathPage: TInputDirWizardPage;
+
+function IsPythonInstalled(): Boolean;
+var
+  ResultCode: Integer;
+begin
+  Result := Exec('cmd.exe', '/C python --version', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
+
+  if not Result then
+    Result := Exec('cmd.exe', '/C py --version', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
+end;
+
+function InstallPythonIfNeeded(): Boolean;
+var
+  ResultCode: Integer;
+  MsgText: String;
+begin
+  Result := True;
+
+  if not IsPythonInstalled() then
+  begin
+    if ActiveLanguage = 'russian' then
+      MsgText := 'Python не найден.' + #13#10 +
+                 'Установщик может установить Python автоматически.' + #13#10#13#10 +
+                 'Продолжить?'
+    else
+      MsgText := 'Python was not found.' + #13#10 +
+                 'The installer can install Python automatically.' + #13#10#13#10 +
+                 'Continue?';
+
+    if MsgBox(MsgText, mbConfirmation, MB_YESNO) = IDYES then
+    begin
+      if not Exec(
+        ExpandConstant('{tmp}\python-3.10.0-amd64.exe'),
+        '/quiet InstallAllUsers=0 PrependPath=1 Include_test=0',
+        '',
+        SW_SHOW,
+        ewWaitUntilTerminated,
+        ResultCode
+      ) then
+      begin
+        if ActiveLanguage = 'russian' then
+          MsgBox('Не удалось запустить установщик Python.', mbError, MB_OK)
+        else
+          MsgBox('Failed to launch Python installer.', mbError, MB_OK);
+        Result := False;
+        exit;
+      end;
+
+      if not IsPythonInstalled() then
+      begin
+        if ActiveLanguage = 'russian' then
+          MsgBox('Python не был найден после установки. Установите его вручную и повторите попытку.', mbError, MB_OK)
+        else
+          MsgBox('Python was not detected after installation. Please install it manually and try again.', mbError, MB_OK);
+        Result := False;
+        exit;
+      end;
+    end
+    else
+    begin
+      Result := False;
+      exit;
+    end;
+  end;
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+begin
+  Result := True;
+
+  if CurPageID = wpReady then
+    Result := InstallPythonIfNeeded();
+end;
 
 procedure InitializeWizard;
 begin
