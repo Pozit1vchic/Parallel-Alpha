@@ -44,7 +44,7 @@ class YoloEngine:
         self.device      = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.model       = None
         self.use_fp16    = (self.device == 'cuda')
-        self._model_path = 'yolo26m-pose.pt'
+        self._model_path = 'yolo26x-pose.pt'
 
         # Кеш последнего рассчитанного batch_size
         # Пересчитывается только при смене разрешения
@@ -56,7 +56,7 @@ class YoloEngine:
     # Загрузка модели
     # ─────────────────────────────────────────────────────────────
 
-    def load(self, model_path: str = 'yolo26m-pose.pt'):
+    def load(self, model_path: str = 'yolo26x-pose.pt'):
         """Загрузить YOLO-pose модель. Повторный вызов — no-op."""
         if self.model is not None:
             return
