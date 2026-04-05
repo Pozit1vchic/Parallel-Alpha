@@ -8,7 +8,7 @@ I built it because manually searching through timelines for matching moments —
 
 ## What it does
 
-- Analyzes video files and detects human poses frame by frame using YOLOv8 Pose
+- Analyzes video files and detects human poses frame by frame using YOLOv26 Pose
 - Finds similar movements across one or multiple video files
 - Displays matches on an interactive timeline with heatmap-style visualization
 - Exports results in JSON, TXT, CSV, or EDL formats for use in editing workflows
