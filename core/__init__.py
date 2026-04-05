@@ -8,7 +8,7 @@ from .project import ProjectManager
 
 __all__ = [
     'YoloEngine',
-    'MotionMatcher', 
+    'MotionMatcher',
     'AnalysisBackend',
-    'ProjectManager'
+    'ProjectManager',
 ]

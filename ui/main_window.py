@@ -1,1107 +1,1260 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""ui/main_window.py — Parallel Finder"""
+from __future__ import annotations
 
-import os
+import gc
+import hashlib
 import json
+import os
+import platform
+import subprocess
+import sys
+import warnings
+from pathlib import Path
+from threading import Thread
+
 import cv2
 import numpy as np
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from threading import Thread
-import time
-import torch
-import torch.nn.functional as F
-from PIL import Image, ImageTk
-import hashlib
-import gc
-import warnings
-import platform
 import psutil
-import bisect
+import torch
+from PIL import Image, ImageTk
+
+import tkinter as tk
+from tkinter import messagebox
 
 from core.engine import YoloEngine
-from core.project import ProjectManager
 
-# Попытка импорта для трея
+# ── Классификатор движений ────────────────────────────────────────────────────
+try:
+    from core.motion_classifier import (
+        MotionClassifier as _MotionClassifier,
+        CATEGORY_LABELS  as _CAT_LABELS,
+    )
+    _motion_clf     = _MotionClassifier()
+    _HAS_CLASSIFIER = True
+except ImportError:
+    _motion_clf     = None
+    _HAS_CLASSIFIER = False
+    _CAT_LABELS     = {}
+
+try:
+    from core.analysis_backend import AnalysisBackend
+    _HAS_BACKEND = True
+except ImportError:
+    _HAS_BACKEND = False
+
+try:
+    from core.project import ProjectManager
+    _HAS_PROJECT = True
+except ImportError:
+    _HAS_PROJECT = False
+
+try:
+    from utils.constants import (
+        APP_DISPLAY_NAME, APP_SHORT_VERSION, APP_BUILD_VERSION,
+        APP_AUTHOR, MODELS_DIR, DEFAULT_MODEL_NAME,
+        YOLO_AVAILABLE_MODELS, VIDEO_EXTENSIONS,
+        is_video_file, get_model_path, is_model_local, list_local_models,
+    )
+except ImportError:
+    APP_DISPLAY_NAME   = "Parallel Finder"
+    APP_SHORT_VERSION  = "Alpha v13"
+    APP_BUILD_VERSION  = "v13.0.2.1"
+    APP_AUTHOR         = "Pozit1vchic"
+    MODELS_DIR         = "models"
+    DEFAULT_MODEL_NAME = "yolo11x-pose.pt"
+    YOLO_AVAILABLE_MODELS: list[str] = [
+        "yolo11n-pose.pt", "yolo11s-pose.pt", "yolo11m-pose.pt",
+        "yolo11l-pose.pt", "yolo11x-pose.pt",
+        "yolo26n-pose.pt", "yolo26s-pose.pt", "yolo26m-pose.pt",
+        "yolo26l-pose.pt", "yolo26x-pose.pt",
+    ]
+    VIDEO_EXTENSIONS = (".mp4",".avi",".mkv",".mov",
+                        ".ts",".webm",".flv",".m4v",".wmv")
+
+    def is_video_file(path: str) -> bool:
+        return os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS
+
+    def get_model_path(name: str):
+        return Path(MODELS_DIR) / name
+
+    def is_model_local(name: str) -> bool:
+        return os.path.exists(os.path.join(MODELS_DIR, name))
+
+    def list_local_models() -> list[str]:
+        if not os.path.isdir(MODELS_DIR):
+            return []
+        return [f for f in os.listdir(MODELS_DIR) if f.endswith(".pt")]
+
+try:
+    from utils.locales import (
+        SUPPORTED_LANGUAGES, DEFAULT_LANGUAGE,
+        get_translator,
+    )
+except ImportError:
+    SUPPORTED_LANGUAGES = ["ru", "en"]
+    DEFAULT_LANGUAGE    = "ru"
+    def get_translator(lang="ru"):
+        return lambda k, **kw: k
+
 try:
     import pystray
     from PIL import Image as PILImage
     TRAY_AVAILABLE = True
 except ImportError:
     TRAY_AVAILABLE = False
-    print("Для трея установи: pip install pystray")
 
-warnings.filterwarnings('ignore')
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    _DND_AVAILABLE = True
+except ImportError:
+    _DND_AVAILABLE = False
 
+from ui.app_state import AppState
+from ui.themes import THEMES
+from ui.overlays.model_loading import ModelLoadingOverlay
+from ui.panels.stats_bar import StatsBar
+from ui.panels.source_panel import SourcePanel
+from ui.panels.settings_panel import SettingsPanel
+from ui.panels.preview_panel import PreviewPanel
+from ui.panels.results_panel import ResultsPanel
+from ui.controllers.analysis_controller import AnalysisController
+from ui.controllers.model_controller import ModelController
+from ui.controllers.export_controller import ExportController
+from ui.controllers.navigation_controller import NavigationController
+from ui.widgets.glow_button import GlowButton
+
+warnings.filterwarnings("ignore")
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
-    torch.set_float32_matmul_precision('high')
+    torch.set_float32_matmul_precision("high")
 
-THEMES = {
-    'dark': {
-        'bg':             '#0a0c10',
-        'card':           '#14171c',
-        'text':           '#ffffff',
-        'text_secondary': '#8a8f99',
-        'accent':         '#3b82f6',
-        'accent_hover':   '#60a5fa',
-        'success':        '#10b981',
-        'error':          '#ef4444',
-        'border':         '#1f2937',
-        'highlight':      '#1e293b',
-        'glow':           '#3b82f6',
-    }
+
+# ── Конфиг ────────────────────────────────────────────────────────────────────
+
+_CONFIG_PATH = Path(__file__).parent.parent / "config.json"
+
+
+class ConfigManager:
+    @staticmethod
+    def load() -> dict:
+        try:
+            return json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    @staticmethod
+    def save(data: dict) -> None:
+        try:
+            _CONFIG_PATH.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False),
+                encoding="utf-8")
+        except Exception:
+            pass
+
+    @staticmethod
+    def get_language(cfg: dict) -> str:
+        lang = cfg.get("language", {}).get("current", DEFAULT_LANGUAGE)
+        return lang if lang in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
+
+    @staticmethod
+    def set_language(lang: str) -> None:
+        cfg = ConfigManager.load()
+        cfg.setdefault("language", {})["current"] = lang
+        ConfigManager.save(cfg)
+
+    @staticmethod
+    def get_model(cfg: dict) -> str:
+        return cfg.get("models", {}).get(
+            "default_model", DEFAULT_MODEL_NAME)
+
+    @staticmethod
+    def set_model(model_name: str) -> None:
+        cfg = ConfigManager.load()
+        cfg.setdefault("models", {})["default_model"] = model_name
+        ConfigManager.save(cfg)
+
+
+# ── Утилиты ───────────────────────────────────────────────────────────────────
+
+def _fmt_hms(secs: float) -> str:
+    s  = max(0.0, float(secs))
+    h, rem = divmod(int(s), 3600)
+    m, ss  = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{ss:02d}"
+
+
+def _fmt_num(n: int) -> str:
+    return f"{n / 1000:.1f}K" if n >= 1000 else str(n)
+
+
+def _build_model_list() -> list[str]:
+    local     = set(list_local_models())
+    all_m     = list(YOLO_AVAILABLE_MODELS)
+    for lm in sorted(local):
+        if lm not in all_m:
+            all_m.insert(0, lm)
+    return ([m for m in all_m if m in local]
+            + [m for m in all_m if m not in local])
+
+
+# ── UI строки ─────────────────────────────────────────────────────────────────
+
+_UI_STRINGS: dict[str, dict[str, str]] = {
+    "models_btn":  {"ru": "Модели",     "en": "Models"},
+    "no_model":    {"ru": "Нет модели", "en": "No model"},
+    "done_found":  {"ru": "Готово. Найдено", "en": "Done. Found"},
+    "repeats":     {"ru": "повторов",   "en": "repeats"},
+    "no_repeats":  {
+        "ru": "Повторений не найдено. Снизьте порог схожести",
+        "en": "No repeats found. Lower the similarity threshold",
+    },
 }
 
-SKELETON_CONNECTIONS = [
-    (0, 1), (0, 2), (1, 3), (2, 4),
-    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
-    (5, 11), (6, 12), (11, 12),
-    (11, 13), (13, 15), (12, 14), (14, 16),
-]
+
+def _S(key: str, lang: str) -> str:
+    return _UI_STRINGS.get(key, {}).get(lang, key)
 
 
-# ══════════════════════════════════════════════════════════════════
-# Вспомогательные виджеты
-# ══════════════════════════════════════════════════════════════════
+# ── Направления ───────────────────────────────────────────────────────────────
 
-class AnimatedProgressbar(ttk.Frame):
-    def __init__(self, parent, **kwargs):
-        super().__init__(parent, **kwargs)
-        self.canvas = tk.Canvas(self, height=8,
-                                bg=THEMES['dark']['bg'], highlightthickness=0)
-        self.canvas.pack(fill=tk.X, expand=True)
-        self.value = 0
-        self._anim_running = False
-
-    def set(self, value: float):
-        self.value = min(100.0, max(0.0, value))
-        self._redraw()
-
-    def _redraw(self):
-        self.canvas.delete("all")
-        w = self.canvas.winfo_width() or 400
-        fill_w = (self.value / 100.0) * w
-        c = THEMES['dark']
-
-        # Фон
-        self.canvas.create_rectangle(0, 0, w, 8, fill=c['border'], outline='')
-
-        if self.value > 0:
-            # Основная заливка
-            self.canvas.create_rectangle(0, 0, fill_w, 8,
-                                         fill=c['accent'], outline='')
-            # Световой блик на конце
-            if 5 < self.value < 95:
-                glow_x1 = max(0, fill_w - 14)
-                self.canvas.create_rectangle(
-                    glow_x1, 1, fill_w, 7,
-                    fill=c['glow'], outline='',
-                )
-
-    def start_animation(self):
-        if not self._anim_running:
-            self._anim_running = True
-            self._animate()
-
-    def stop_animation(self):
-        self._anim_running = False
-
-    def _animate(self):
-        if not self._anim_running:
-            return
-        self._redraw()
-        self.after(32, self._animate)   # ~30 fps достаточно
+_DIRECTION_LABELS: dict[str, dict[str, str]] = {
+    "forward":       {"ru": "↑ Лицом к камере",    "en": "↑ Facing camera"},
+    "left":          {"ru": "← Смотрит влево",      "en": "← Facing left"},
+    "right":         {"ru": "→ Смотрит вправо",     "en": "→ Facing right"},
+    "back":          {"ru": "↓ Спиной к камере",    "en": "↓ Facing away"},
+    "forward-right": {"ru": "↗ Пол-оборота вправо", "en": "↗ Half-turn right"},
+    "forward-left":  {"ru": "↖ Пол-оборота влево",  "en": "↖ Half-turn left"},
+    "back-right":    {"ru": "↘ Спиной-вправо",      "en": "↘ Back-right"},
+    "back-left":     {"ru": "↙ Спиной-влево",       "en": "↙ Back-left"},
+    "unknown":       {"ru": "? Неизвестно",          "en": "? Unknown"},
+}
 
 
-class GlowButton(tk.Canvas):
-    """Кастомная кнопка с закруглёнными углами и hover-эффектом."""
-
-    def __init__(self, parent, text, command, bg_color, hover_color,
-                 width=120, height=32, state='normal'):
-        super().__init__(parent, highlightthickness=0,
-                         width=width, height=height,
-                         bg=THEMES['dark']['bg'])
-        self.command     = command
-        self.bg_color    = bg_color
-        self.hover_color = hover_color
-        self.text        = text
-        self._state      = state
-        self._is_hover   = False
-
-        self.bind("<Enter>",     self._on_enter)
-        self.bind("<Leave>",     self._on_leave)
-        self.bind("<Button-1>",  self._on_click)
-        self.bind("<Configure>", lambda e: self._draw(self._is_hover))
-
-        self._draw(False)
-
-    # ── Рисование ───────────────────────────────────────────────
-
-    def _draw(self, is_hover: bool = False):
-        self._is_hover = is_hover
-        self.delete("all")
-
-        w = self.winfo_width()  or int(self['width'])
-        h = self.winfo_height() or int(self['height'])
-
-        color = self.hover_color if (is_hover and self._state != 'disabled') \
-                else self.bg_color
-
-        if self._state == 'disabled':
-            color = THEMES['dark']['border']
-
-        self._round_rect(0, 0, w, h, radius=8, fill=color)
-        fg = THEMES['dark']['text_secondary'] if self._state == 'disabled' \
-             else 'white'
-        self.create_text(w // 2, h // 2, text=self.text,
-                         fill=fg, font=('Inter', 10, 'bold'), justify='center')
-
-    def _round_rect(self, x1, y1, x2, y2, radius, **kwargs):
-        pts = [
-            x1 + radius, y1,
-            x2 - radius, y1,
-            x2, y1,
-            x2, y1 + radius,
-            x2, y2 - radius,
-            x2, y2,
-            x2 - radius, y2,
-            x1 + radius, y2,
-            x1, y2,
-            x1, y2 - radius,
-            x1, y1 + radius,
-            x1, y1,
-        ]
-        return self.create_polygon(pts, smooth=True, **kwargs)
-
-    # ── Обработчики ─────────────────────────────────────────────
-
-    def _on_enter(self, _e):
-        if self._state != 'disabled':
-            self._draw(True)
-
-    def _on_leave(self, _e):
-        self._draw(False)
-
-    def _on_click(self, _e):
-        if self._state != 'disabled' and self.command:
-            self.command()
-
-    # ── Конфиг (совместимость с tk.Widget.config) ───────────────
-
-    def config(self, **kwargs):
-        if 'state' in kwargs:
-            self._state = kwargs.pop('state')
-            self._draw(self._is_hover)
-        if kwargs:
-            super().config(**kwargs)
-
-    configure = config
+def _direction_label(direction: str, lang: str) -> str:
+    return _DIRECTION_LABELS.get(
+        direction, _DIRECTION_LABELS["unknown"]
+    ).get(lang, direction)
 
 
-# ══════════════════════════════════════════════════════════════════
-# Главное приложение
-# ══════════════════════════════════════════════════════════════════
+# ── Кэш кадров ────────────────────────────────────────────────────────────────
 
-class ParallelFinderApp:
+class FrameCache:
+    def __init__(self, cache_dir: str, limit: int = 200) -> None:
+        self._dir   = Path(cache_dir)
+        self._limit = limit
+        self._dir.mkdir(parents=True, exist_ok=True)
 
-    def __init__(self):
-        self.root = tk.Tk()
-        self.root.title("Parallel Finder")
-        self.root.geometry("1600x900")
-        self.root.minsize(1400, 800)
-        self.colors = THEMES['dark']
-        self.root.configure(bg=self.colors['bg'])
+    def _key(self, path: str, frame: int, w: int, h: int) -> Path:
+        vh = hashlib.md5(path.encode()).hexdigest()
+        return self._dir / f"{vh}_{frame}_{w}x{h}.jpg"
 
-        # Иконка окна
+    def get(self, path: str, frame: int,
+            w: int, h: int) -> np.ndarray | None:
+        p = self._key(path, frame, w, h)
+        if p.exists():
+            img = cv2.imread(str(p))
+            if img is not None:
+                return img
+        return None
+
+    def put(self, path: str, frame: int, w: int, h: int,
+            img: np.ndarray) -> None:
+        p = self._key(path, frame, w, h)
+        cv2.imwrite(str(p), img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        self._evict()
+
+    def _evict(self) -> None:
+        files = sorted(self._dir.glob("*.jpg"),
+                       key=lambda f: f.stat().st_mtime)
+        for old in files[: max(0, len(files) - self._limit)]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+
+# ── Классификатор матчей ──────────────────────────────────────────────────────
+
+class MatchClassifier:
+    """Классифицирует список матчей."""
+
+    def __init__(self, lang: str = "ru") -> None:
+        self.lang = lang
+
+    def classify_all(self, matches: list[dict]) -> list[str]:
+        """
+        Классифицирует все матчи.
+        Возвращает список локализованных меток категорий
+        (для отображения в UI).
+        Также записывает в каждый матч:
+          m["_cat_key"]  — внутренний ключ категории
+          m["category"]  — локализованная метка
+        """
+        seen:    set[str]  = set()
+        ordered: list[str] = []
+
+        for m in matches:
+            cat_key, label = self._classify_one(m)
+            if label not in seen:
+                seen.add(label)
+                ordered.append(label)
+
+        return ordered
+
+    def relabel_all(self, matches: list[dict]) -> list[str]:
+        """
+        Перелокализовать уже классифицированные матчи
+        при смене языка. Использует сохранённый _cat_key.
+        """
+        seen:    set[str]  = set()
+        ordered: list[str] = []
+
+        for m in matches:
+            cat_key = m.get("_cat_key", "")
+            lang    = self.lang
+
+            if cat_key and _HAS_CLASSIFIER:
+                label = _CAT_LABELS.get(
+                    cat_key, {}).get(lang, cat_key)
+            else:
+                # Направление — перелокализуем
+                direction = m.get("direction", "unknown")
+                label     = _direction_label(direction, lang)
+
+            # Обновляем отображаемые поля
+            dir_lbl  = _direction_label(
+                m.get("direction", "unknown"), lang)
+            movement = _CAT_LABELS.get(
+                cat_key, {}).get(lang, cat_key) if cat_key else dir_lbl
+
+            m["category"]  = label
+            m["movement"]  = movement
+            m["dir_label"] = dir_lbl
+
+            if label not in seen:
+                seen.add(label)
+                ordered.append(label)
+
+        return ordered
+
+    def _classify_one(self, m: dict) -> tuple[str, str]:
+        """
+        Возвращает (cat_key, localized_label).
+        Сохраняет cat_key в m["_cat_key"].
+        """
+        direction = m.get("direction", "unknown")
+        lang      = self.lang
+
+        if _HAS_CLASSIFIER and _motion_clf is not None:
+            try:
+                kp_raw = m.get("kp1") or m.get("kp2")
+
+                if kp_raw is not None:
+                    kp_arr = np.array(kp_raw, dtype=float)
+
+                    if kp_arr.ndim == 1:
+                        n = len(kp_arr)
+                        if n == 51:
+                            kp_arr = kp_arr.reshape(17, 3)
+                        elif n == 34:
+                            kp_arr = np.hstack([
+                                kp_arr.reshape(17, 2),
+                                np.ones((17, 1))
+                            ])
+                        else:
+                            raise ValueError(
+                                f"Неожиданная форма kp: {n}")
+
+                    elif kp_arr.ndim == 2:
+                        if kp_arr.shape[1] == 2:
+                            kp_arr = np.hstack([
+                                kp_arr,
+                                np.ones((kp_arr.shape[0], 1))
+                            ])
+                        elif kp_arr.shape[1] != 3:
+                            raise ValueError(
+                                f"Неожиданное число столбцов: "
+                                f"{kp_arr.shape[1]}")
+
+                    else:
+                        raise ValueError(
+                            f"Неожиданная размерность: "
+                            f"{kp_arr.ndim}")
+
+                    if kp_arr.shape[0] < 17:
+                        raise ValueError(
+                            f"Мало точек: {kp_arr.shape[0]}")
+
+                    kp_arr = kp_arr[:17]
+                    res    = _motion_clf.classify(kp_arr, lang)
+
+                    cat_key  = res["category"]
+                    movement = res["movement"]
+                    dir_lbl  = _direction_label(direction, lang)
+                    label    = _CAT_LABELS.get(
+                        cat_key, {}).get(lang, cat_key)
+
+                    m["_cat_key"]  = cat_key
+                    m["category"]  = label
+                    m["movement"]  = movement
+                    m["dir_label"] = dir_lbl
+
+                    return cat_key, label
+
+                # kp_raw is None
+                lbl = _direction_label(direction, lang)
+                m["_cat_key"]  = ""
+                m["category"]  = lbl
+                m["movement"]  = lbl
+                m["dir_label"] = lbl
+                return "", lbl
+
+            except Exception as ex:
+                print(f"[Classify] {ex}")
+                lbl = _direction_label(direction, lang)
+                m["_cat_key"]  = ""
+                m["category"]  = lbl
+                m["dir_label"] = lbl
+                return "", lbl
+
+        # Нет классификатора
+        lbl = _direction_label(direction, lang)
+        m["_cat_key"]  = ""
+        m["category"]  = lbl
+        m["movement"]  = lbl
+        m["dir_label"] = lbl
+        return "", lbl
+
+# ── Диалог выбора модели ──────────────────────────────────────────────────────
+
+class ModelSelectorDialog:
+    ROW_H = 44
+
+    def __init__(self, parent: tk.Tk, colors: dict,
+                 lang: str, current_model: str,
+                 on_apply) -> None:
+        self._parent   = parent
+        self._c        = colors
+        self._lang     = lang
+        self._current  = current_model
+        self._on_apply = on_apply
+        self._models   = _build_model_list()
+        self._local    = set(list_local_models())
+        self._selected = tk.IntVar(value=0)
+
         try:
-            icon_path = os.path.join(os.path.dirname(__file__),
-                                     "..", "icons", "icon.ico")
-            if os.path.exists(icon_path):
-                self.root.iconbitmap(icon_path)
-        except Exception:
+            self._selected.set(
+                self._models.index(current_model))
+        except ValueError:
             pass
 
-        # ── Tkinter-переменные настроек ──────────────────────────────────
-        self.threshold             = tk.IntVar(value=70)
-        self.scene_interval        = tk.IntVar(value=3)
-        self.match_gap             = tk.IntVar(value=4)
-        self.motion_length         = tk.DoubleVar(value=2.0)
-        self.frame_skip            = tk.IntVar(value=2)
-        self.quality               = tk.StringVar(value='Средне')
-        self.use_scale_invariance  = tk.BooleanVar(value=True)
-        self.use_mirror_invariance = tk.BooleanVar(value=False)
-        self.use_body_weights      = tk.BooleanVar(value=False)
+        self._dlg = self._build()
 
-        # ── YOLO ─────────────────────────────────────────────────────────
-        self.yolo = YoloEngine()
-        self.yolo.load()
+    _STRINGS: dict[str, dict[str, str]] = {
+        "title":     {"ru": "Выбор модели",    "en": "Select Model"},
+        "legend":    {
+            "ru": "✓ — загружена локально  |  ↓ — требует скачивания",
+            "en": "✓ — installed locally  |  ↓ — needs download",
+        },
+        "installed": {"ru": "Установлено",     "en": "Installed"},
+        "available": {"ru": "Доступно",        "en": "Available"},
+        "active":    {"ru": "● активна",       "en": "● active"},
+        "download":  {"ru": "↓ скачать",       "en": "↓ download"},
+        "apply":     {"ru": "Применить",       "en": "Apply"},
+        "cancel":    {"ru": "Отмена",          "en": "Cancel"},
+    }
 
-        # ── Состояние приложения ─────────────────────────────────────────
-        self.video_path               = None
-        self.video_queue:        list = []
-        self.batch_mode:         bool = False
-        self.analysis_running:   bool = False
-        self.poses_tensor              = None
-        self.poses_meta:         list = []
-        self.matches:            list = []
-        self.current_match:      int  = 0
-        self.current_batch_index:int  = 0
-        self.total_batch_videos: int  = 0
+    def _s(self, key: str) -> str:
+        return self._STRINGS.get(key, {}).get(self._lang, key)
 
-        # ── Параметры (будут переопределены авто-настройкой) ─────────────
-        self.BATCH_SIZE            = 32
-        self.CHUNK_SIZE            = 3000
-        self.CHUNK_OVERLAP         = 300
-        self.MIN_MATCH_GAP         = 5.0
-        self.max_matches_per_chunk = 500_000
-        self.max_total_matches     = 10_000_000
-        self._max_unique_results   = 1000
-        self._junk_ratio           = 0.20
+    def _build(self) -> tk.Toplevel:
+        c   = self._c
+        dlg = tk.Toplevel(self._parent)
+        dlg.title(self._s("title"))
+        dlg.geometry("520x560")
+        dlg.configure(bg=c["bg"])
+        dlg.transient(self._parent)
+        dlg.grab_set()
+        dlg.resizable(False, False)
 
-        # ── Кеш превью ───────────────────────────────────────────────────
-        self.preview_cache_dir = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "..", "cache", "previews",
-        )
-        os.makedirs(self.preview_cache_dir, exist_ok=True)
+        dlg.update_idletasks()
+        x = (self._parent.winfo_x()
+             + (self._parent.winfo_width() - 520) // 2)
+        y = (self._parent.winfo_y()
+             + (self._parent.winfo_height() - 560) // 2)
+        dlg.geometry(f"520x560+{x}+{y}")
 
-        # ── Вспомогательные структуры ────────────────────────────────────
-        self.value_labels:          dict = {}
-        self.metric_values:         dict = {}
-        self.video_durations_cache: dict = {}
+        tk.Label(dlg, text=self._s("title"),
+                 font=("Inter", 14, "bold"),
+                 bg=c["bg"], fg=c["text"]).pack(pady=(20, 4))
 
-        self.setup_ui()
-        self.setup_hotkeys()
+        tk.Label(dlg, text=self._s("legend"),
+                 font=("Inter", 9),
+                 bg=c["bg"],
+                 fg=c["text_secondary"]).pack(pady=(0, 10))
 
-        # Трей
-        self._create_tray_icon()
+        local_c = len(self._local & set(self._models))
+        counter = (f"{self._s('installed')}: {local_c}  |  "
+                   f"{self._s('available')}: {len(self._models)}")
+        tk.Label(dlg, text=counter,
+                 font=("Inter", 8),
+                 bg=c["bg"],
+                 fg=c.get("text_secondary", "#6b7280")).pack(
+            pady=(0, 6))
+
+        outer = tk.Frame(dlg, bg=c["card"],
+                         highlightbackground=c["border"],
+                         highlightthickness=1)
+        outer.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 10))
+
+        self._cv = tk.Canvas(outer, bg=c["card"],
+                             highlightthickness=0)
+        sb = tk.Scrollbar(outer, orient=tk.VERTICAL,
+                          command=self._cv.yview)
+        self._cv.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._cv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self._local_count = sum(
+            1 for m in self._models if m in self._local)
+
+        self._cv.bind("<Configure>", lambda _: self._draw())
+        self._cv.bind("<Button-1>",  self._on_click)
+        self._cv.bind("<MouseWheel>", self._on_scroll)
+        self._cv.bind("<Button-4>",
+                      lambda _: (self._cv.yview_scroll(-1, "units"),
+                                 self._draw()))
+        self._cv.bind("<Button-5>",
+                      lambda _: (self._cv.yview_scroll(1, "units"),
+                                 self._draw()))
+
+        dlg.bind("<Up>",     lambda _: self._move(-1))
+        dlg.bind("<Down>",   lambda _: self._move(+1))
+        dlg.bind("<Return>", lambda _: self._apply())
+        dlg.focus_set()
+
+        btn_row = tk.Frame(dlg, bg=c["bg"])
+        btn_row.pack(fill=tk.X, padx=20, pady=(0, 16))
+
+        GlowButton(btn_row,
+                   text=self._s("apply"),
+                   command=self._apply,
+                   bg_color=c["accent"],
+                   hover_color=c["accent_hover"],
+                   height=36,
+                   font=("Inter", 10, "bold")).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+
+        GlowButton(btn_row,
+                   text=self._s("cancel"),
+                   command=dlg.destroy,
+                   bg_color=c["highlight"],
+                   hover_color=c["border"],
+                   height=36,
+                   font=("Inter", 10)).pack(
+            side=tk.LEFT, fill=tk.X, expand=True)
+
+        dlg.after(80, lambda: self._ensure_visible(
+            self._selected.get()))
+        return dlg
+
+    def _draw(self) -> None:
+        c      = self._c
+        cv     = self._cv
+        models = self._models
+        local  = self._local
+
+        cv.delete("all")
+        cw = cv.winfo_width() or 460
+        n  = len(models)
+        if n == 0:
+            return
+
+        cv.configure(scrollregion=(0, 0, cw, n * self.ROW_H))
+        vt       = cv.yview()[0]
+        total_h  = n * self.ROW_H
+        y_off    = vt * total_h
+        ch_      = cv.winfo_height() or 350
+        si       = max(0, int(y_off // self.ROW_H) - 1)
+        ei       = min(n, si + int(ch_ // self.ROW_H) + 3)
+
+        for i in range(si, ei):
+            name   = models[i]
+            y      = i * self.ROW_H - y_off
+            is_loc = name in local
+            is_sel = i == self._selected.get()
+            is_cur = name == self._current
+
+            bg_row = self._row_color(is_sel, is_loc, i)
+            cv.create_rectangle(0, y, cw, y + self.ROW_H - 1,
+                                fill=bg_row, outline="")
+
+            if (i == self._local_count
+                    and 0 < self._local_count < n):
+                cv.create_line(0, y, cw, y,
+                               fill=c.get("accent", "#3b82f6"),
+                               width=1, dash=(4, 4))
+
+            icon = "✓" if is_loc else "↓"
+            icon_col = (c.get("success", "#22c55e") if is_loc
+                        else c.get("text_secondary", "#6b7280"))
+            cv.create_text(20, y + self.ROW_H // 2,
+                           text=icon, fill=icon_col,
+                           font=("Inter", 12, "bold"),
+                           anchor="center")
+
+            name_col = (c.get("text", "#fff") if is_sel
+                        else (c.get("text", "#e2e8f0") if is_loc
+                              else c.get("text_secondary", "#6b7280")))
+            weight = "bold" if (is_sel or is_cur) else "normal"
+            cv.create_text(42, y + self.ROW_H // 2,
+                           text=name.replace(".pt", ""),
+                           fill=name_col,
+                           font=("Inter", 10, weight),
+                           anchor="w")
+
+            if is_cur:
+                cv.create_text(cw - 12, y + self.ROW_H // 2,
+                               text=self._s("active"),
+                               fill=c.get("accent", "#3b82f6"),
+                               font=("Inter", 9), anchor="e")
+            elif not is_loc:
+                cv.create_text(cw - 12, y + self.ROW_H // 2,
+                               text=self._s("download"),
+                               fill=c.get("text_secondary", "#6b7280"),
+                               font=("Inter", 9), anchor="e")
+
+            cv.create_line(0, y + self.ROW_H - 1,
+                           cw, y + self.ROW_H - 1,
+                           fill=c.get("border", "#2a2f38"))
+
+    def _row_color(self, is_sel: bool,
+                   is_loc: bool, i: int) -> str:
+        c = self._c
+        if is_sel:
+            return c.get("active_row", "#1e3a5f")
+        if is_loc:
+            return c.get("card", "#14171c")
+        return (c.get("highlight", "#1e293b") if i % 2 == 0
+                else c.get("card", "#14171c"))
+
+    def _on_click(self, e: tk.Event) -> None:
+        vt      = self._cv.yview()[0]
+        total_h = len(self._models) * self.ROW_H
+        abs_y   = e.y + vt * total_h
+        i       = int(abs_y // self.ROW_H)
+        if 0 <= i < len(self._models):
+            self._selected.set(i)
+            self._draw()
+
+    def _on_scroll(self, e: tk.Event) -> None:
+        self._cv.yview_scroll(
+            -1 if e.delta > 0 else 1, "units")
+        self._draw()
+
+    def _move(self, delta: int) -> None:
+        cur = self._selected.get()
+        nxt = max(0, min(len(self._models) - 1, cur + delta))
+        self._selected.set(nxt)
+        self._ensure_visible(nxt)
+
+    def _ensure_visible(self, i: int) -> None:
+        total_h = len(self._models) * self.ROW_H
+        if total_h == 0:
+            return
+        ch_  = self._cv.winfo_height() or 350
+        top  = i * self.ROW_H
+        bot  = top + self.ROW_H
+        vt   = self._cv.yview()[0] * total_h
+        vb   = self._cv.yview()[1] * total_h
+        if top < vt:
+            self._cv.yview_moveto(top / max(total_h, 1))
+        elif bot > vb:
+            self._cv.yview_moveto((bot - ch_) / max(total_h, 1))
+        self._draw()
+
+    def _apply(self) -> None:
+        i = self._selected.get()
+        if 0 <= i < len(self._models):
+            chosen = self._models[i]
+            self._dlg.destroy()
+            if chosen != self._current:
+                self._on_apply(chosen)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+class ParallelFinderApp:
+    """Главное окно Parallel Finder."""
+
+    def __init__(self) -> None:
+        self.root      = self._create_root()
+        self._cfg      = ConfigManager.load()
+        self._lang     = ConfigManager.get_language(self._cfg)
+        self.colors    = THEMES["dark"]
+        self.state     = AppState()
+
+        self._configure_root()
+        self.root.withdraw()
+        self.root.update_idletasks()
+        self.root.deiconify()
+        self._init_model_name()
+        self._init_backend()
+        self._init_subsystems()
+
+        self._overlay      = ModelLoadingOverlay(self.root, self.colors)
+        self._overlay = ModelLoadingOverlay(
+            self.root, self.colors, lang=self._lang)
+        self._fullscreen   = False
+        self._tray_icon    = None
+        self._child_procs: list[subprocess.Popen] = []
+
+
+        self._build_ui()
+        self._init_controllers()
+        self._setup_drag_drop()
+
+        self._nav_ctrl.setup_hotkeys(
+            self.root,
+            on_start         = self._analysis_ctrl.start,
+            on_fullscreen    = self._toggle_fullscreen,
+            on_exit_fullscreen = self._exit_fullscreen)
+
+        self._create_tray()
         self.root.protocol("WM_DELETE_WINDOW", self._hide_to_tray)
 
-        # Автонастройка под железо (в конце, чтобы UI уже был готов)
-        self._auto_tune_hardware()
-
-    # ══════════════════════════════════════════════════════════════
-    # ТРЕЙ
-    # ══════════════════════════════════════════════════════════════
-
-    def _create_tray_icon(self):
-        if not TRAY_AVAILABLE:
-            return
         try:
-            tray_path = os.path.join(os.path.dirname(__file__),
-                                     "..", "icons", "tray_icon.png")
-            if os.path.exists(tray_path):
-                image = PILImage.open(tray_path)
-            else:
-                image = PILImage.new('RGB', (64, 64), color='#3b82f6')
-
-            menu = pystray.Menu(
-                pystray.MenuItem("Показать", self._show_window),
-                pystray.MenuItem("Скрыть",   self._hide_window),
-                pystray.MenuItem("Выход",    self._quit_app),
-            )
-            self.tray_icon = pystray.Icon(
-                "parallel_finder", image, "Parallel Finder", menu
-            )
-            self.tray_icon.run_detached()
-        except Exception as e:
-            print(f"Ошибка создания трея: {e}")
-
-    def _show_window(self):
-        self.root.deiconify()
-        self.root.lift()
-        self.root.focus_force()
-
-    def _hide_window(self):
-        self.root.withdraw()
-
-    def _hide_to_tray(self):
-        self._hide_window()
-
-    def _quit_app(self):
-        if hasattr(self, 'tray_icon'):
-            try:
-                self.tray_icon.stop()
-            except Exception:
-                pass
-        self.analysis_running = False
-        self.root.quit()
-        self.root.destroy()
-
-    # ══════════════════════════════════════════════════════════════
-    # АВТОНАСТРОЙКА
-    # ══════════════════════════════════════════════════════════════
-
-    def _auto_tune_hardware(self):
-        """
-        Автоматическая настройка параметров под железо пользователя.
-
-        Логика выбора пресета:
-        - CPU-only: по объёму RAM (< 4 / 4-8 / 8-16 / 16-32 / >32 GB).
-        - GPU:      по объёму VRAM с детальным охватом всех актуальных карт
-                    включая RTX 40xx и RTX 50xx серии.
-
-        Каждый пресет задаёт:
-          batch         – кадров в одном YOLO-запросе
-          chunk         – размер окна при матричном сравнении поз
-          overlap       – перекрытие чанков (уменьшает пропуски на границах)
-          quality       – режим FPS-семплинга ('Быстро'/'Средне'/'Макс')
-          matches_chunk – лимит пар за один чанк (защита от OOM)
-          total_matches – глобальный лимит пар до дедупликации
-          max_unique    – максимум финальных уникальных совпадений
-          min_gap       – минимальный интервал между найденными позами (с)
-          fp16          – использование float16 (только GPU)
-          junk_ratio    – доля "мусорных" (sim < 0.85) совпадений для дедупл.
-          desc          – человекочитаемое описание пресета
-        """
-        print("\n" + "=" * 70)
-        print("АВТОНАСТРОЙКА ПОД ЖЕЛЕЗО")
-        print("=" * 70)
-
-        cpu_cores = psutil.cpu_count(logical=True)  or 1
-        cpu_phys  = psutil.cpu_count(logical=False) or 1
-        cpu_name  = platform.processor() or "Unknown"
-        ram_gb    = psutil.virtual_memory().total / 1e9
-
-        print(f"CPU : {cpu_name}")
-        print(f"      ядра: {cpu_phys} физических / {cpu_cores} логических")
-        print(f"RAM : {ram_gb:.1f} GB")
-
-        gpu_available = torch.cuda.is_available()
-        vram_gb  = 0.0
-        gpu_name = "Не обнаружен"
-
-        if gpu_available:
-            try:
-                gpu_name  = torch.cuda.get_device_name(0)
-                vram_gb   = torch.cuda.get_device_properties(0).total_memory / 1e9
-                cuda_ver  = torch.version.cuda or "?"
-                cc_major  = torch.cuda.get_device_properties(0).major
-                cc_minor  = torch.cuda.get_device_properties(0).minor
-                print(f"GPU : {gpu_name}")
-                print(f"      VRAM: {vram_gb:.1f} GB  |  CUDA: {cuda_ver}  "
-                      f"|  CC: {cc_major}.{cc_minor}")
-            except Exception as e:
-                print(f"Ошибка определения GPU: {e}")
-                gpu_available = False
-
-        # ── Таблица пресетов ─────────────────────────────────────────────────
-        # Примеры карт для ориентира:
-        #   < 2 GB  : GT 1030, iGPU, MX150
-        #   2-3 GB  : GTX 1050, GTX 750 Ti, MX450
-        #   3-5 GB  : GTX 1050 Ti (4G), GTX 1650 (4G), RX 570 (4G)
-        #   5-7 GB  : RTX 2060 (6G), GTX 1660 (6G), RX 5600 XT (6G)
-        #   7-9 GB  : RTX 2070 (8G), RTX 3070 (8G), RX 6700 XT (8G)
-        #   9-11 GB : RTX 3080 (10G), RX 6800 (10G), A2000 (10G)
-        #  11-14 GB : RTX 2080 Ti (11G), RTX 3080 Ti (12G), RTX 3060 (12G),
-        #             RTX 4070 (12G), A2000 (12G)
-        #  14-18 GB : RTX 4070 Ti (16G), RTX 4080 (16G), A4000 (16G),
-        #             RTX 5070 (15G), RTX 5070 Ti (16G)
-        #  18-26 GB : RTX 3090 (24G), RTX 4090 (24G), RTX 5080 (16G→24G),
-        #             A5000 (24G), RTX 5090 (32G)
-        #  >= 26 GB : RTX 5090 (32G), A6000 (48G), серверные GPU
-
-        CONFIGS: dict = {
-
-            # ─── CPU-only ────────────────────────────────────────────────────
-            'cpu_very_low': {   # < 4 GB RAM — нетбуки, слабые ноуты
-                'batch': 2,   'chunk': 400,   'overlap': 40,
-                'quality': 'Быстро',
-                'matches_chunk': 30_000,    'total_matches': 300_000,
-                'max_unique': 150, 'min_gap': 3.0,
-                'fp16': False, 'junk_ratio': 0.10,
-                'desc': 'CPU (< 4 GB RAM) — аварийный режим',
-            },
-            'cpu_low': {        # 4–8 GB RAM
-                'batch': 4,   'chunk': 700,   'overlap': 70,
-                'quality': 'Быстро',
-                'matches_chunk': 80_000,    'total_matches': 800_000,
-                'max_unique': 250, 'min_gap': 3.0,
-                'fp16': False, 'junk_ratio': 0.12,
-                'desc': 'CPU (4–8 GB RAM) — минимальный режим',
-            },
-            'cpu_mid': {        # 8–16 GB RAM
-                'batch': 6,   'chunk': 1000,  'overlap': 100,
-                'quality': 'Быстро',
-                'matches_chunk': 150_000,   'total_matches': 2_000_000,
-                'max_unique': 400, 'min_gap': 3.0,
-                'fp16': False, 'junk_ratio': 0.15,
-                'desc': 'CPU (8–16 GB RAM) — стабильный режим',
-            },
-            'cpu_high': {       # 16–32 GB RAM
-                'batch': 10,  'chunk': 1800,  'overlap': 180,
-                'quality': 'Средне',
-                'matches_chunk': 400_000,   'total_matches': 6_000_000,
-                'max_unique': 600, 'min_gap': 3.0,
-                'fp16': False, 'junk_ratio': 0.18,
-                'desc': 'CPU (16–32 GB RAM) — комфортный режим',
-            },
-            'cpu_workstation': {  # > 32 GB RAM (серверы / рабочие станции)
-                'batch': 16,  'chunk': 2500,  'overlap': 250,
-                'quality': 'Средне',
-                'matches_chunk': 800_000,   'total_matches': 12_000_000,
-                'max_unique': 700, 'min_gap': 3.0,
-                'fp16': False, 'junk_ratio': 0.20,
-                'desc': 'CPU (> 32 GB RAM) — рабочая станция',
-            },
-
-            # ─── GPU слабый ──────────────────────────────────────────────────
-            'gpu_igpu': {       # iGPU / GT 1030 / MX150 / < 2 GB VRAM
-                'batch': 4,   'chunk': 600,   'overlap': 60,
-                'quality': 'Быстро',
-                'matches_chunk': 60_000,    'total_matches': 800_000,
-                'max_unique': 250, 'min_gap': 3.0,
-                'fp16': True,  'junk_ratio': 0.10,
-                'desc': 'iGPU / GT 1030 (< 2 GB VRAM)',
-            },
-            'gpu_2gb': {        # GTX 1050 / GTX 750 Ti / MX450 / 2–3 GB
-                'batch': 10,  'chunk': 1000,  'overlap': 100,
-                'quality': 'Быстро',
-                'matches_chunk': 120_000,   'total_matches': 1_500_000,
-                'max_unique': 350, 'min_gap': 3.0,
-                'fp16': True,  'junk_ratio': 0.12,
-                'desc': 'GTX 1050 / GTX 750 Ti / MX450 (2–3 GB VRAM)',
-            },
-            'gpu_4gb': {        # GTX 1050 Ti / GTX 1650 / RX 570 / 3–5 GB
-                'batch': 18,  'chunk': 1500,  'overlap': 150,
-                'quality': 'Быстро',
-                'matches_chunk': 250_000,   'total_matches': 4_000_000,
-                'max_unique': 450, 'min_gap': 3.0,
-                'fp16': True,  'junk_ratio': 0.15,
-                'desc': 'GTX 1050 Ti / GTX 1650 / RX 570 (3–5 GB VRAM)',
-            },
-
-            # ─── GPU средний ─────────────────────────────────────────────────
-            'gpu_6gb': {        # RTX 2060 / GTX 1660 / RX 5600 XT / 5–7 GB
-                'batch': 28,  'chunk': 2200,  'overlap': 220,
-                'quality': 'Средне',
-                'matches_chunk': 500_000,   'total_matches': 8_000_000,
-                'max_unique': 600, 'min_gap': 4.0,
-                'fp16': True,  'junk_ratio': 0.18,
-                'desc': 'RTX 2060 / GTX 1660 / RX 5600 XT (5–7 GB VRAM)',
-            },
-            'gpu_8gb': {        # RTX 2070/3070 / RX 6700 XT / 7–9 GB
-                'batch': 42,  'chunk': 3000,  'overlap': 300,
-                'quality': 'Средне',
-                'matches_chunk': 900_000,   'total_matches': 12_000_000,
-                'max_unique': 750, 'min_gap': 4.0,
-                'fp16': True,  'junk_ratio': 0.20,
-                'desc': 'RTX 2070/3070 / RX 6700 XT (7–9 GB VRAM)',
-            },
-
-            # ─── GPU хороший ─────────────────────────────────────────────────
-            'gpu_10gb': {       # RTX 3080 10G / RX 6800 / A2000 10G / 9–11 GB
-                'batch': 52,  'chunk': 4000,  'overlap': 400,
-                'quality': 'Средне',
-                'matches_chunk': 1_300_000, 'total_matches': 18_000_000,
-                'max_unique': 850, 'min_gap': 4.0,
-                'fp16': True,  'junk_ratio': 0.20,
-                'desc': 'RTX 3080 10 GB / RX 6800 / A2000 (9–11 GB VRAM)',
-            },
-            'gpu_12gb': {       # RTX 3060 12G / RTX 3080 Ti / RTX 4070 12G / 11–14 GB
-                'batch': 64,  'chunk': 5000,  'overlap': 500,
-                'quality': 'Макс',
-                'matches_chunk': 1_800_000, 'total_matches': 25_000_000,
-                'max_unique': 1000, 'min_gap': 5.0,
-                'fp16': True,  'junk_ratio': 0.22,
-                'desc': 'RTX 3060/4070 12 GB / RTX 3080 Ti (11–14 GB VRAM)',
-            },
-
-            # ─── GPU флагман (включая RTX 40xx и RTX 50xx) ───────────────────
-            'gpu_16gb': {       # RTX 4070 Ti / RTX 4080 / RTX 5070/Ti / A4000 / 14–20 GB
-                'batch': 88,  'chunk': 7000,  'overlap': 700,
-                'quality': 'Макс',
-                'matches_chunk': 2_800_000, 'total_matches': 45_000_000,
-                'max_unique': 1000, 'min_gap': 5.0,
-                'fp16': True,  'junk_ratio': 0.25,
-                'desc': 'RTX 4070 Ti / RTX 4080 / RTX 5070 Ti / A4000 (14–20 GB VRAM)',
-            },
-            'gpu_24gb': {       # RTX 3090 / RTX 4090 / RTX 5080 / A5000 / 20–28 GB
-                'batch': 120, 'chunk': 10000, 'overlap': 1000,
-                'quality': 'Макс',
-                'matches_chunk': 4_500_000, 'total_matches': 80_000_000,
-                'max_unique': 1000, 'min_gap': 5.0,
-                'fp16': True,  'junk_ratio': 0.28,
-                'desc': 'RTX 3090/4090/5080 / A5000 (20–28 GB VRAM)',
-            },
-            'gpu_32gb': {       # RTX 5090 / A6000 / L40 / >= 28 GB
-                'batch': 160, 'chunk': 14000, 'overlap': 1400,
-                'quality': 'Макс',
-                'matches_chunk': 7_000_000, 'total_matches': 150_000_000,
-                'max_unique': 1000, 'min_gap': 5.0,
-                'fp16': True,  'junk_ratio': 0.30,
-                'desc': 'RTX 5090 / A6000 / L40 (>= 28 GB VRAM) — абсолютный максимум',
-            },
-        }
-
-        # ── Выбор пресета ────────────────────────────────────────────────────
-        if not gpu_available:
-            if ram_gb < 4:
-                cfg_key = 'cpu_very_low'
-            elif ram_gb < 8:
-                cfg_key = 'cpu_low'
-            elif ram_gb < 16:
-                cfg_key = 'cpu_mid'
-            elif ram_gb < 32:
-                cfg_key = 'cpu_high'
-            else:
-                cfg_key = 'cpu_workstation'
-        else:
-            # GPU-ветка: выбор по VRAM
-            if vram_gb < 2:
-                cfg_key = 'gpu_igpu'
-            elif vram_gb < 3:
-                cfg_key = 'gpu_2gb'
-            elif vram_gb < 5:
-                cfg_key = 'gpu_4gb'
-            elif vram_gb < 7:
-                cfg_key = 'gpu_6gb'
-            elif vram_gb < 9:
-                cfg_key = 'gpu_8gb'
-            elif vram_gb < 11:
-                cfg_key = 'gpu_10gb'
-            elif vram_gb < 14:
-                cfg_key = 'gpu_12gb'
-            elif vram_gb < 20:
-                cfg_key = 'gpu_16gb'
-            elif vram_gb < 28:
-                cfg_key = 'gpu_24gb'
-            else:
-                cfg_key = 'gpu_32gb'
-
-        cfg = CONFIGS[cfg_key]
-
-        # ── Применение пресета ───────────────────────────────────────────────
-        self.BATCH_SIZE            = cfg['batch']
-        self.CHUNK_SIZE            = cfg['chunk']
-        self.CHUNK_OVERLAP         = cfg['overlap']
-        self.MIN_MATCH_GAP         = cfg['min_gap']
-        self.max_matches_per_chunk = cfg['matches_chunk']
-        self.max_total_matches     = cfg['total_matches']
-        self._max_unique_results   = cfg['max_unique']
-        self._junk_ratio           = cfg['junk_ratio']
-        self.quality.set(cfg['quality'])
-
-        # FP16 доступен только при CUDA
-        self.yolo.use_fp16 = (gpu_available and cfg['fp16'])
-
-        print(f"\nВыбран пресет  : [{cfg_key}] {cfg['desc']}")
-        print(f"  BATCH_SIZE            = {self.BATCH_SIZE}")
-        print(f"  CHUNK_SIZE            = {self.CHUNK_SIZE}")
-        print(f"  CHUNK_OVERLAP         = {self.CHUNK_OVERLAP}")
-        print(f"  MIN_MATCH_GAP         = {self.MIN_MATCH_GAP} с")
-        print(f"  max_matches_per_chunk = {self.max_matches_per_chunk:,}")
-        print(f"  max_total_matches     = {self.max_total_matches:,}")
-        print(f"  max_unique_results    = {self._max_unique_results}")
-        print(f"  junk_ratio            = {self._junk_ratio:.0%}")
-        print(f"  Качество (FPS-режим)  = {self.quality.get()}")
-        print(f"  FP16                  = {self.yolo.use_fp16}")
-        print("=" * 70 + "\n")
-
-    # ══════════════════════════════════════════════════════════════
-    # UI — сборка
-    # ══════════════════════════════════════════════════════════════
-
-    def on_closing(self):
-        self._quit_app()
-
-    def setup_ui(self):
-        main = tk.Frame(self.root, bg=self.colors['bg'])
-        main.pack(fill=tk.BOTH, expand=True, padx=32, pady=32)
-
-        self.setup_stats_panel(main)
-
-        content = tk.Frame(main, bg=self.colors['bg'])
-        content.pack(fill=tk.BOTH, expand=True, pady=24)
-
-        left = tk.Frame(content, bg=self.colors['bg'], width=400)
-        left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 12), expand=False)
-        left.pack_propagate(False)
-
-        center = tk.Frame(content, bg=self.colors['bg'])
-        center.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=6)
-
-        right = tk.Frame(content, bg=self.colors['bg'], width=400)
-        right.pack(side=tk.RIGHT, fill=tk.Y, padx=(12, 0), expand=False)
-        right.pack_propagate(False)
-
-        self.setup_video_panel(left)
-        self.setup_settings_panel(left)
-        self.setup_preview_panel(center)
-        self.setup_results_panel(right)
-
-    def setup_stats_panel(self, parent):
-        stats = tk.Frame(parent, bg=self.colors['bg'])
-        stats.pack(fill=tk.X)
-
-        self.metric_values = {
-            'frames':         tk.StringVar(value="0"),
-            'patterns':       tk.StringVar(value="0"),
-            'duration':       tk.StringVar(value="0:00"),
-            'accuracy':       tk.StringVar(value="0%"),
-            'time_left':      tk.StringVar(value="--:--"),
-            'batch_progress': tk.StringVar(value="0/0"),
-        }
-
-        metrics = [
-            ('Кадров',       'frames'),
-            ('Повторов',     'patterns'),
-            ('Длительность', 'duration'),
-            ('Схожесть',     'accuracy'),
-            ('Осталось',     'time_left'),
-            ('Прогресс',     'batch_progress'),
-        ]
-
-        for i, (label, var) in enumerate(metrics):
-            card = tk.Frame(stats, bg=self.colors['card'], padx=15, pady=12)
-            card.pack(side=tk.LEFT, padx=(0 if i == 0 else 8, 0),
-                      expand=True, fill=tk.BOTH)
-
-            tk.Label(card, textvariable=self.metric_values[var],
-                     font=('Inter', 20, 'bold'),
-                     bg=self.colors['card'], fg=self.colors['text']).pack(anchor='w')
-            tk.Label(card, text=label, font=('Inter', 10),
-                     bg=self.colors['card'],
-                     fg=self.colors['text_secondary']).pack(anchor='w')
-
-    def setup_video_panel(self, parent):
-        card = tk.Frame(parent, bg=self.colors['card'])
-        card.pack(fill=tk.X, pady=(0, 16))
-
-        inner = tk.Frame(card, bg=self.colors['card'], padx=20, pady=20)
-        inner.pack(fill=tk.X)
-
-        tk.Label(inner, text="Источник", font=('Inter', 14, 'bold'),
-                 bg=self.colors['card'], fg=self.colors['text']).pack(
-            anchor='w', pady=(0, 12))
-
-        self.video_label = tk.Label(inner, text="Файл не выбран",
-                                    font=('Inter', 11),
-                                    bg=self.colors['card'],
-                                    fg=self.colors['text_secondary'],
-                                    wraplength=320)
-        self.video_label.pack(anchor='w', pady=(0, 4))
-
-        self.video_info = tk.Label(inner, text="", font=('Inter', 10),
-                                   bg=self.colors['card'],
-                                   fg=self.colors['text_secondary'])
-        self.video_info.pack(anchor='w', pady=(0, 12))
-
-        btn_frame = tk.Frame(inner, bg=self.colors['card'])
-        btn_frame.pack(fill=tk.X, pady=(0, 5))
-
-        GlowButton(btn_frame, "Выбрать видео", self.select_video,
-                   self.colors['accent'], self.colors['accent_hover'],
-                   width=120, height=34).pack(side=tk.LEFT, padx=(0, 8))
-
-        GlowButton(btn_frame, "Выбрать папку", self.select_folder,
-                   self.colors['success'], '#2ecc71',
-                   width=120, height=34).pack(side=tk.LEFT)
-
-        self.batch_info = tk.Label(inner, text="", font=('Inter', 9),
-                                   bg=self.colors['card'],
-                                   fg=self.colors['text_secondary'])
-        self.batch_info.pack(anchor='w', pady=(8, 0))
-
-    def setup_settings_panel(self, parent):
-        container = tk.Frame(parent, bg=self.colors['card'])
-        container.pack(fill=tk.BOTH, expand=True)
-
-        canvas    = tk.Canvas(container, bg=self.colors['card'],
-                              highlightthickness=0, bd=0)
-        scrollbar = tk.Scrollbar(container, orient=tk.VERTICAL,
-                                 command=canvas.yview)
-        scrollable = tk.Frame(canvas, bg=self.colors['card'])
-
-        scrollable.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        win_id = canvas.create_window((0, 0), window=scrollable, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        canvas.bind(
-            "<Configure>",
-            lambda e: canvas.itemconfigure(
-                win_id, width=e.width - scrollbar.winfo_width()
-            ),
-        )
-
-        card = scrollable
-
-        tk.Label(card, text="Настройки анализа", font=('Inter', 14, 'bold'),
-                 bg=self.colors['card'], fg=self.colors['text']).pack(
-            anchor='w', padx=20, pady=(20, 8))
-
-        tk.Frame(card, bg=self.colors['border'], height=1).pack(
-            fill=tk.X, padx=20, pady=(10, 16))
-
-        # ── Точность ──────────────────────────────────────────────────────
-        g1 = tk.Frame(card, bg=self.colors['card'])
-        g1.pack(fill=tk.X, padx=20, pady=(0, 20))
-
-        tk.Label(g1, text="Точность", font=('Inter', 12, 'bold'),
-                 bg=self.colors['card'], fg=self.colors['text']).pack(
-            anchor='w', pady=(0, 10))
-
-        self.add_setting_row(g1, "Порог схожести",
-                             self.threshold, 50, 98, 70, "%")
-
-        q_frame = tk.Frame(g1, bg=self.colors['card'])
-        q_frame.pack(fill=tk.X, pady=(0, 12))
-        tk.Label(q_frame, text="Качество", font=('Inter', 10),
-                 bg=self.colors['card'],
-                 fg=self.colors['text_secondary']).pack(anchor='w')
-        self.quality_combo = ttk.Combobox(
-            q_frame, textvariable=self.quality,
-            values=['Быстро', 'Средне', 'Макс'],
-            font=('Inter', 10), state='readonly',
-        )
-        self.quality_combo.pack(fill=tk.X, pady=(4, 0))
-
-        # ── Временные параметры ───────────────────────────────────────────
-        g2 = tk.Frame(card, bg=self.colors['card'])
-        g2.pack(fill=tk.X, padx=20, pady=(0, 20))
-
-        tk.Label(g2, text="Временные параметры", font=('Inter', 12, 'bold'),
-                 bg=self.colors['card'], fg=self.colors['text']).pack(
-            anchor='w', pady=(0, 10))
-
-        self.add_setting_row(g2, "Интервал сцен",
-                             self.scene_interval, 1, 30, 3, "сек")
-        self.add_setting_row(g2, "Мин. интервал между повторами",
-                             self.match_gap, 1, 30, 4, "сек")
-
-        # ── Расширенные опции ─────────────────────────────────────────────
-        g3 = tk.Frame(card, bg=self.colors['card'])
-        g3.pack(fill=tk.X, padx=20, pady=(0, 20))
-
-        tk.Label(g3, text="Расширенные опции", font=('Inter', 12, 'bold'),
-                 bg=self.colors['card'], fg=self.colors['text']).pack(
-            anchor='w', pady=(0, 10))
-
-        for text, var in [
-            ("Нормализация по размеру",         self.use_scale_invariance),
-            ("Учитывать зеркальное отражение",  self.use_mirror_invariance),
-            ("Веса частей тела",                self.use_body_weights),
-        ]:
-            tk.Checkbutton(
-                g3, text=text, variable=var,
-                bg=self.colors['card'], fg=self.colors['text_secondary'],
-                selectcolor=self.colors['bg'],
-                activebackground=self.colors['card'],
-            ).pack(anchor='w')
-
-        tk.Frame(card, bg=self.colors['border'], height=1).pack(
-            fill=tk.X, padx=20, pady=(10, 16))
-
-        btn_frame = tk.Frame(card, bg=self.colors['card'])
-        btn_frame.pack(fill=tk.X, padx=20, pady=(0, 20))
-
-        self.start_btn = GlowButton(
-            btn_frame, "Старт", self.start_analysis,
-            self.colors['success'], '#2ecc71', width=400, height=42,
-        )
-        self.start_btn.pack(fill=tk.X, pady=(0, 8))
-
-        self.stop_btn = GlowButton(
-            btn_frame, "Стоп", self.stop_analysis,
-            self.colors['error'], '#ff6b6b', width=400, height=38,
-        )
-        self.stop_btn.pack(fill=tk.X)
-
-    def add_setting_row(self, parent, label, var, from_, to, default, unit,
-                        step=1):
-        frame = tk.Frame(parent, bg=self.colors['card'])
-        frame.pack(fill=tk.X, pady=(0, 12))
-
-        top = tk.Frame(frame, bg=self.colors['card'])
-        top.pack(fill=tk.X, pady=(0, 4))
-
-        tk.Label(top, text=label, font=('Inter', 10),
-                 bg=self.colors['card'],
-                 fg=self.colors['text_secondary']).pack(side=tk.LEFT)
-
-        val_label = tk.Label(top, text=f"{default}{unit}",
-                             font=('Inter', 14, 'bold'),
-                             bg=self.colors['card'],
-                             fg=self.colors['accent'])
-        val_label.pack(side=tk.RIGHT)
-        self.value_labels[label] = val_label
-
-        scale = tk.Scale(
-            frame, from_=from_, to=to, resolution=step,
-            orient=tk.HORIZONTAL, variable=var,
-            bg=self.colors['card'], fg=self.colors['text'],
-            highlightbackground=self.colors['card'],
-            troughcolor=self.colors['bg'],
-            sliderrelief='flat', sliderlength=18, width=6,
-            command=lambda v, l=label, u=unit: self._update_value(l, v, u),
-        )
-        var.set(default)
-        scale.pack(fill=tk.X)
-
-    def _update_value(self, label: str, value, unit: str):
-        if label in self.value_labels:
-            self.value_labels[label].config(text=f"{int(float(value))}{unit}")
-
-    def update_value(self, label, value, unit):
-        self._update_value(label, value, unit)
-
-    def setup_preview_panel(self, parent):
-        # Прогресс
-        progress_card = tk.Frame(parent, bg=self.colors['card'])
-        progress_card.pack(fill=tk.X, pady=(0, 12))
-
-        p_inner = tk.Frame(progress_card, bg=self.colors['card'],
-                           padx=16, pady=16)
-        p_inner.pack(fill=tk.X)
-
-        header = tk.Frame(p_inner, bg=self.colors['card'])
-        header.pack(fill=tk.X, pady=(0, 8))
-
-        tk.Label(header, text="Прогресс", font=('Inter', 13, 'bold'),
-                 bg=self.colors['card'],
-                 fg=self.colors['text']).pack(side=tk.LEFT)
-
-        self.progress_label = tk.Label(header, text="0%",
-                                       font=('Inter', 14, 'bold'),
-                                       bg=self.colors['card'],
-                                       fg=self.colors['accent'])
-        self.progress_label.pack(side=tk.RIGHT)
-
-        self.progress = AnimatedProgressbar(p_inner)
-        self.progress.pack(fill=tk.X, pady=(8, 4))
-
-        self.status_label = tk.Label(p_inner, text="Ожидание",
-                                     font=('Inter', 10),
-                                     bg=self.colors['card'],
-                                     fg=self.colors['text_secondary'])
-        self.status_label.pack(anchor='w')
-
-        # Превью
-        preview_card = tk.Frame(parent, bg=self.colors['card'])
-        preview_card.pack(fill=tk.BOTH, expand=True)
-
-        pv_inner = tk.Frame(preview_card, bg=self.colors['card'],
-                            padx=16, pady=16)
-        pv_inner.pack(fill=tk.BOTH, expand=True)
-
-        title_frame = tk.Frame(pv_inner, bg=self.colors['card'])
-        title_frame.pack(fill=tk.X, pady=(0, 12))
-
-        tk.Label(title_frame, text="Сравнение", font=('Inter', 13, 'bold'),
-                 bg=self.colors['card'],
-                 fg=self.colors['text']).pack(side=tk.LEFT)
-
-        self.match_info = tk.Label(title_frame, text="",
-                                   font=('Inter', 10),
-                                   bg=self.colors['card'],
-                                   fg=self.colors['text_secondary'])
-        self.match_info.pack(side=tk.RIGHT)
-
-        video_row = tk.Frame(pv_inner, bg=self.colors['bg'])
-        video_row.pack(fill=tk.BOTH, expand=True)
-
-        self.preview1, self.time1_label, self.action1_label = \
-            self._create_video_widget(video_row)
-        self.preview2, self.time2_label, self.action2_label = \
-            self._create_video_widget(video_row)
-
-        self.setup_timeline_panel(pv_inner)
-
-    def _create_video_widget(self, parent):
-        video_frame = tk.Frame(parent, bg=self.colors['bg'])
-        side = tk.LEFT if not parent.winfo_children() else tk.RIGHT
-        video_frame.pack(side=side, padx=8, expand=True, fill=tk.BOTH)
-
-        container = tk.Frame(video_frame, bg=self.colors['bg'])
-        container.pack(fill=tk.BOTH, expand=True)
-
-        preview = tk.Label(container, bg=self.colors['bg'])
-        preview.pack(fill=tk.BOTH, expand=True)
-
-        time_label = tk.Label(container, text="--:--",
-                              font=('Inter', 14, 'bold'),
-                              bg='#1e1e2e', fg='white', padx=6, pady=2)
-        time_label.place(relx=0.02, rely=0.02)
-
-        action_label = tk.Label(container, text="",
-                                font=('Inter', 10),
-                                bg='#1e1e2e', fg=self.colors['accent'],
-                                padx=6, pady=2)
-        action_label.place(relx=0.02, rely=0.12)
-
-        return preview, time_label, action_label
-
-    def setup_timeline_panel(self, parent):
-        timeline_frame = tk.Frame(parent, bg=self.colors['card'], pady=5)
-        timeline_frame.pack(fill=tk.X, pady=(12, 0))
-
-        tk.Label(timeline_frame, text="Таймлайн", font=('Inter', 10),
-                 bg=self.colors['card'],
-                 fg=self.colors['text_secondary']).pack(side=tk.LEFT,
-                                                        padx=(0, 10))
-
-        self.timeline_canvas = tk.Canvas(timeline_frame, height=40,
-                                         bg=self.colors['bg'],
-                                         highlightthickness=0)
-        self.timeline_canvas.pack(fill=tk.X, expand=True)
-        self.timeline_canvas.bind("<Button-1>", self.on_timeline_click)
-
-    def setup_results_panel(self, parent):
-        card = tk.Frame(parent, bg=self.colors['card'])
-        card.pack(fill=tk.BOTH, expand=True)
-
-        inner = tk.Frame(card, bg=self.colors['card'], padx=16, pady=16)
-        inner.pack(fill=tk.BOTH, expand=True)
-
-        tk.Label(inner, text="Результаты", font=('Inter', 13, 'bold'),
-                 bg=self.colors['card'],
-                 fg=self.colors['text']).pack(anchor='w', pady=(0, 12))
-
-        # Навигация
-        nav_frame = tk.Frame(inner, bg=self.colors['card'])
-        nav_frame.pack(fill=tk.X, pady=(0, 10))
-
-        self.prev_btn = GlowButton(
-            nav_frame, "Предыдущий", self.prev_match,
-            self.colors['highlight'], self.colors['border'],
-            width=100, height=30,
-        )
-        self.prev_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 4))
-
-        self.match_counter = tk.Label(nav_frame, text="0/0",
-                                      font=('Inter', 10),
-                                      bg=self.colors['card'],
-                                      fg=self.colors['text'])
-        self.match_counter.pack(side=tk.LEFT, padx=8)
-
-        self.next_btn = GlowButton(
-            nav_frame, "Следующий", self.next_match,
-            self.colors['highlight'], self.colors['border'],
-            width=100, height=30,
-        )
-        self.next_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(4, 0))
-
-        # Список результатов
-        list_frame = tk.Frame(inner, bg=self.colors['bg'])
-        list_frame.pack(fill=tk.BOTH, expand=True)
-
-        scrollbar = tk.Scrollbar(list_frame)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        self.results_list = tk.Listbox(
-            list_frame, yscrollcommand=scrollbar.set,
-            bg=self.colors['bg'], fg=self.colors['text'],
-            selectbackground=self.colors['accent'],
-            font=('Inter', 10), bd=0,
-            highlightthickness=1,
-            highlightbackground=self.colors['border'],
-        )
-        self.results_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.config(command=self.results_list.yview)
-        self.results_list.bind('<<ListboxSelect>>', self.on_select)
-
-        # Экспорт
-        export_frame = tk.Frame(inner, bg=self.colors['card'])
-        export_frame.pack(fill=tk.X, pady=(10, 0))
-
-        for label, cmd in [
-            ("JSON", self.export_json),
-            ("TXT",  self.export_txt),
-            ("EDL",  self.export_edl),
-        ]:
-            GlowButton(export_frame, label, cmd,
-                       self.colors['highlight'], self.colors['border'],
-                       width=60, height=30).pack(side=tk.LEFT, padx=(0, 4))
-
-    def setup_hotkeys(self):
-        self.root.bind('<space>', lambda e: self.start_analysis())
-        self.root.bind('<Up>',    lambda e: self.prev_match())
-        self.root.bind('<Down>',  lambda e: self.next_match())
-
-    # ══════════════════════════════════════════════════════════════
-    # ВЫБОР ВИДЕО
-    # ══════════════════════════════════════════════════════════════
-
-    def select_video(self):
-        try:
-            path = filedialog.askopenfilename(
-                filetypes=[("Видео",
-                            "*.mp4 *.avi *.mkv *.mov *.ts *.webm "
-                            "*.flv *.m4v *.wmv *.3gp")]
-            )
-            if path:
-                self.video_queue = [path]
-                self.batch_mode  = False
-                self.video_label.config(text=os.path.basename(path))
-                self.batch_info.config(text="")
-                self.update_video_info(path)
-                self.video_path = path
-                self._reset_state()
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось открыть видео: {e}")
-
-    def select_folder(self):
-        try:
-            folder = filedialog.askdirectory(title="Выберите папку с видео")
-            if folder:
-                exts = ('.mp4', '.avi', '.mkv', '.mov', '.ts',
-                        '.webm', '.flv', '.m4v', '.wmv', '.3gp')
-                self.video_queue = sorted([
-                    os.path.join(folder, f)
-                    for f in os.listdir(folder)
-                    if f.lower().endswith(exts)
-                ])
-                if self.video_queue:
-                    self.batch_mode = True
-                    self.video_label.config(
-                        text=f"Папка: {os.path.basename(folder)}")
-                    self.batch_info.config(
-                        text=f"Видео: {len(self.video_queue)}")
-                    self.update_video_info(self.video_queue[0])
-                    self.video_path = self.video_queue[0]
-                    self._reset_state()
-                else:
-                    messagebox.showwarning(
-                        "Пусто", "В выбранной папке нет поддерживаемых видеофайлов.")
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось открыть папку: {e}")
-
-    def _reset_state(self):
-        self.matches        = []
-        self.poses_tensor   = None
-        self.poses_meta     = []
-        self.current_match  = 0
-        self.results_list.delete(0, tk.END)
-        self.timeline_canvas.delete("all")
-        self.metric_values['patterns'].set("0")
-        self.metric_values['accuracy'].set("0%")
-        self.root.title("Parallel Finder")
-
-    def update_video_info(self, path: str):
-        try:
-            cap    = cv2.VideoCapture(path)
-            frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            fps    = cap.get(cv2.CAP_PROP_FPS) or 30.0
-            dur    = frames / fps
-            cap.release()
-            self.metric_values['frames'].set(self._fmt_num(frames))
-            self.metric_values['duration'].set(self._fmt_time(dur))
-            self.video_info.config(
-                text=f"{self._fmt_num(frames)} кадров • {fps:.0f} fps")
+            cfg_q = self._analysis_ctrl.auto_tune()
+            self._settings_panel.set_quality(cfg_q["quality"])
         except Exception:
             pass
 
-    def _get_video_duration(self, path: str) -> float:
-        """Длительность видео в секундах (с кешированием)."""
-        if path in self.video_durations_cache:
-            return self.video_durations_cache[path]
-        dur = 0.0
+        self.root.after(0, self._start_model_load)
+
+    # ── Инициализация ─────────────────────────────────────────────────────
+
+    def _create_root(self) -> tk.Tk:
+        try:
+            if _DND_AVAILABLE:
+                return TkinterDnD.Tk()
+        except Exception:
+            pass
+        return tk.Tk()
+
+    def _configure_root(self) -> None:
+        self.root.attributes("-alpha", 0.0)
+        ui = self._cfg.get("ui", {})
+        self.root.title(APP_DISPLAY_NAME)
+        ui = self._cfg.get("ui", {})
+        self.root.title(APP_DISPLAY_NAME)
+        self.root.geometry(
+            f"{ui.get('window_width', 1600)}x"
+            f"{ui.get('window_height', 960)}")
+        self.root.minsize(1400, 800)
+        self.root.configure(bg=self.colors["bg"])
+
+        icon = Path(__file__).parent.parent / "icons" / "icon.ico"
+        if icon.exists():
+            try:
+                self.root.iconbitmap(str(icon))
+            except Exception:
+                pass
+        self.root.after(50, lambda: self.root.attributes("-alpha", 1.0))
+
+    def _init_model_name(self) -> None:
+        saved        = ConfigManager.get_model(self._cfg)
+        local_models = list_local_models()
+        if saved in local_models:
+            self.state.current_model_name = saved
+        elif local_models:
+            self.state.current_model_name = local_models[0]
+        else:
+            self.state.current_model_name = DEFAULT_MODEL_NAME
+
+    def _init_backend(self) -> None:
+        self.yolo    = YoloEngine()
+        self.backend = None
+        if _HAS_BACKEND:
+            try:
+                device       = "cuda" if torch.cuda.is_available() else None
+                self.backend = AnalysisBackend(
+                    device=device, yolo=self.yolo)
+            except Exception as e:
+                print(f"[Backend] {e}")
+
+    def _init_subsystems(self) -> None:
+        self.project = None
+        if _HAS_PROJECT:
+            try:
+                from core.project import ProjectManager
+                self.project = ProjectManager()
+            except Exception:
+                pass
+
+        self._frame_cache = FrameCache(
+            str(Path(__file__).parent.parent / "cache" / "previews"),
+            limit=200)
+        self._classifier = MatchClassifier(self._lang)
+
+    def _start_model_load(self) -> None:
+        try:
+            name = self.state.current_model_name
+            # Показываем оверлей сразу до отрисовки основного UI
+            self._overlay.show(
+                title      = "Подготавливаем модель распознавания поз",
+                subtitle   = "Подготавливаем файлы модели",
+                model_name = name)
+            # Принудительно отрисовываем оверлей до загрузки модели
+            self.root.update_idletasks()
+            self._model_ctrl.load_model(name)
+        except Exception as e:
+            print(f"[ModelLoad] {e}")
+
+    # ── Сборка UI ─────────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        c = self.colors
+        self._build_topbar(c)
+
+        main = tk.Frame(self.root, bg=c["bg"])
+        main.pack(fill=tk.BOTH, expand=True, padx=28, pady=(6, 28))
+
+        self._stats_bar = StatsBar(main, c, lang=self._lang)
+        self._stats_bar.pack(fill=tk.X)
+
+        content = tk.Frame(main, bg=c["bg"])
+        content.pack(fill=tk.BOTH, expand=True, pady=12)
+
+        left = tk.Frame(content, bg=c["bg"], width=400)
+        left.pack(side=tk.LEFT, fill=tk.Y,
+                  padx=(0, 10), expand=False)
+        left.pack_propagate(False)
+
+        center = tk.Frame(content, bg=c["bg"])
+        center.pack(side=tk.LEFT, fill=tk.BOTH,
+                    expand=True, padx=5)
+
+        right = tk.Frame(content, bg=c["bg"], width=400)
+        right.pack(side=tk.RIGHT, fill=tk.Y,
+                   padx=(10, 0), expand=False)
+        right.pack_propagate(False)
+
+        self._build_left_panels(left)
+        self._build_center_panel(center)
+        self._build_right_panel(right)
+
+    def _build_topbar(self, c: dict) -> None:
+        topbar = tk.Frame(self.root, bg=c["bg"], height=44)
+        topbar.pack(fill=tk.X, padx=28, pady=(12, 0))
+        topbar.pack_propagate(False)
+
+        tk.Label(topbar,
+                 text="PARALLEL  ALPHA",
+                 font=("Inter", 11, "bold"),
+                 bg=c["bg"],
+                 fg=c["text_secondary"]).pack(
+            side=tk.LEFT, pady=8)
+
+        self._lang_btn = GlowButton(
+            topbar,
+            text=self._lang.upper(),
+            command=self._toggle_language,
+            bg_color=c["highlight"],
+            hover_color=c["border"],
+            width=48, height=28,
+            font=("Inter", 9, "bold"))
+        self._lang_btn.pack(side=tk.RIGHT, padx=(6, 0), pady=8)
+
+        self._model_lbl = tk.Label(
+            topbar,
+            text=self._model_short_label,
+            font=("Inter", 9),
+            bg=c["bg"],
+            fg=c["accent"],
+            cursor="hand2")
+        self._model_lbl.pack(side=tk.RIGHT, padx=(0, 4), pady=8)
+        self._model_lbl.bind("<Button-1>",
+                             lambda _: self._open_model_menu())
+
+        self._models_btn = GlowButton(
+            topbar,
+            text=_S("models_btn", self._lang),
+            command=self._open_model_menu,
+            bg_color=c["highlight"],
+            hover_color=c["border"],
+            width=80, height=28,
+            font=("Inter", 9, "bold"))
+        self._models_btn.pack(side=tk.RIGHT, padx=(6, 2), pady=8)
+
+    def _build_left_panels(self, parent: tk.Frame) -> None:
+        self._source_panel = SourcePanel(
+            parent, self.state, self.colors,
+            callbacks={"on_queue_changed": self._on_queue_changed},
+            video_extensions=VIDEO_EXTENSIONS,
+            is_video_file_fn=is_video_file,
+            lang=self._lang)
+        self._source_panel.pack(fill=tk.X)
+
+        self._settings_panel = SettingsPanel(
+            parent, self.state, self.colors,
+            callbacks={
+                "on_start": lambda: self._analysis_ctrl.start(),
+                "on_stop":  lambda: self._analysis_ctrl.stop(),
+                "on_queue_cleared": self._on_queue_cleared,
+            },
+            lang=self._lang)
+        self._settings_panel.pack(fill=tk.BOTH, expand=True)
+
+    def _build_center_panel(self, parent: tk.Frame) -> None:
+        self._preview_panel = PreviewPanel(
+            parent, self.state, self.colors,
+            callbacks={
+                "on_resize":         self._on_preview_resize,
+                "on_timeline_click": self._on_timeline_click,
+            })
+        self._preview_panel.pack(fill=tk.BOTH, expand=True)
+
+    def _build_right_panel(self, parent: tk.Frame) -> None:
+        self._results_panel = ResultsPanel(
+            parent, self.state, self.colors,
+            callbacks={
+                "on_prev":        lambda: self._nav_ctrl.prev_match(),
+                "on_next":        lambda: self._nav_ctrl.next_match(),
+                "on_select":      self._on_result_select,
+                "on_export_json": lambda: self._export_ctrl.export_json(),
+                "on_export_txt":  lambda: self._export_ctrl.export_txt(),
+                "on_export_edl":  lambda: self._export_ctrl.export_edl(),
+            },
+            lang=self._lang)
+        self._results_panel.pack(fill=tk.BOTH, expand=True)
+
+    # ── Контроллеры ───────────────────────────────────────────────────────
+
+    def _init_controllers(self) -> None:
+        vars_ = self._settings_panel.get_vars()
+
+        self._analysis_ctrl = AnalysisController(
+            root             = self.root,
+            state            = self.state,
+            yolo             = self.yolo,
+            backend          = self.backend if _HAS_BACKEND else None,
+            on_progress      = self._on_progress,
+            on_complete      = self._on_analysis_complete,
+            on_batch_status  = self._on_batch_status)
+        self._analysis_ctrl.bind_vars(
+            threshold        = vars_["threshold"],
+            scene_interval   = vars_["scene_interval"],
+            match_gap        = vars_["match_gap"],
+            quality          = vars_["quality"],
+            use_scale_inv    = vars_["use_scale_invariance"],
+            use_mirror_inv   = vars_["use_mirror_invariance"],
+            use_body_weights = vars_["use_body_weights"])
+
+        self._model_ctrl = ModelController(
+            root               = self.root,
+            state              = self.state,
+            yolo               = self.yolo,
+            overlay            = self._overlay,
+            all_models         = YOLO_AVAILABLE_MODELS,
+            available_models   = YOLO_AVAILABLE_MODELS,
+            is_model_local_fn  = is_model_local,
+            get_model_path_fn  = get_model_path,
+            on_model_ready     = self._on_model_ready)
+        self._model_ctrl.set_colors(self.colors)
+
+        self._export_ctrl = ExportController(
+            state              = self.state,
+            app_display_name   = APP_DISPLAY_NAME,
+            app_short_version  = APP_SHORT_VERSION,
+            app_build_version  = APP_BUILD_VERSION,
+            app_author         = APP_AUTHOR)
+
+        self._nav_ctrl = NavigationController(
+            root             = self.root,
+            state            = self.state,
+            on_show_preview  = self._show_preview)
+
+    # ── Свойства ──────────────────────────────────────────────────────────
+
+    @property
+    def _model_short_label(self) -> str:
+        name = self.state.current_model_name
+        icon = "✓" if is_model_local(name) else "↓"
+        return f"{icon} {name.replace('.pt', '')}"
+
+    # ── Model selector ────────────────────────────────────────────────────
+
+    def _open_model_menu(self) -> None:
+        ModelSelectorDialog(
+            parent        = self.root,
+            colors        = self.colors,
+            lang          = self._lang,
+            current_model = self.state.current_model_name,
+            on_apply      = self._on_model_selected,
+        )
+
+    def _on_model_selected(self, model_name: str) -> None:
+        self._models_btn.set_disabled(True)
+        self._model_ctrl.load_model(model_name)
+
+    # ── Callbacks ─────────────────────────────────────────────────────────
+
+    def _on_model_ready(self, model_name: str) -> None:
+        self.state.current_model_name = model_name
+        ConfigManager.set_model(model_name)
+        try:
+            color = (self.colors["success"]
+                     if is_model_local(model_name)
+                     else self.colors["accent"])
+            self._model_lbl.config(
+                text=self._model_short_label, fg=color)
+            self._models_btn.set_disabled(False)
+        except Exception:
+            pass
+
+    def _on_queue_changed(self) -> None:
+        self.state.reset()
+        self._results_panel.hide_results()
+        try:
+            self._preview_panel._cached_durations = []
+            self._preview_panel.timeline_canvas.delete("all")
+        except Exception:
+            pass
+        for key, val in [("patterns", "0"), ("accuracy", "0%"),
+                         ("frames", "0"), ("duration", "00:00:00"),
+                         ("time_left", "--:--:--")]:
+            self._stats_bar.set(key, val)
+        self._results_panel.update_counter(0, 0)
+        self.root.title(APP_DISPLAY_NAME)
+
+    def _on_queue_cleared(self) -> None:
+        """Сброс после очистки очереди из панели настроек."""
+        try:
+            self._source_panel.refresh_ui()
+        except Exception:
+            pass
+        self._on_queue_changed()
+
+    def _on_progress(self, pct: float, status: str = "") -> None:
+        try:
+            self._preview_panel.set_progress(pct, status)
+
+            # Длительность — из кэша один раз
+            if self.state.video_queue:
+                total_dur = sum(
+                    self._get_duration(p)
+                    for p in self.state.video_queue)
+                self._stats_bar.set(
+                    "duration", _fmt_hms(total_dur))
+
+                # Кадров — плавно, пропорционально прогрессу
+                if pct < 100:
+                    total_frames = sum(
+                        self._get_frame_count(p)
+                        for p in self.state.video_queue)
+                    current_frames = int(total_frames * pct / 100)
+                    self._stats_bar.set(
+                        "frames", _fmt_num(current_frames))
+
+                # Осталось — оценка по прогрессу
+                if 0 < pct < 100:
+                    ratio     = pct / 100
+                    remaining = (total_dur
+                                 * (1 - ratio)
+                                 / max(ratio, 0.01))
+                    self._stats_bar.set(
+                        "time_left", _fmt_hms(remaining))
+                elif pct >= 100:
+                    self._stats_bar.set("time_left", "00:00:00")
+
+        except Exception as e:
+            print(f"[Progress] {e}")
+
+    def _on_batch_status(self, path: str,
+                         idx: int, total: int) -> None:
+        try:
+            self._preview_panel.set_status(
+                f"{idx + 1}/{total}: {os.path.basename(path)}")
+            self._stats_bar.set(
+                "batch_progress", f"{idx + 1}/{total}")
+        except Exception:
+            pass
+
+    def _on_analysis_complete(self, matches: list) -> None:
+        try:
+            self.state.matches          = matches
+            self.state.analysis_running = False
+
+            self._settings_panel.set_analysis_state(False)
+            self._models_btn.set_disabled(False)
+            self._preview_panel.stop_animation()
+
+            if matches:
+                self._process_matches(matches)
+            else:
+                self._preview_panel.set_status(
+                    _S("no_repeats", self._lang))
+                self._results_panel.hide_results()
+
+            self._preview_panel.set_progress(100)
+            self._stats_bar.set("time_left", "00:00:00")
+
+            # Финальное обновление кадров
+            if self.state.video_queue:
+                total_frames = sum(
+                    self._get_frame_count(p)
+                    for p in self.state.video_queue)
+                self._stats_bar.set(
+                    "frames", _fmt_num(total_frames))
+                total_dur = sum(
+                    self._get_duration(p)
+                    for p in self.state.video_queue)
+                self._stats_bar.set(
+                    "duration", _fmt_hms(total_dur))
+
+        except Exception as e:
+            print(f"[AnalysisComplete] {e}")
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+
+    def _process_matches(self, matches: list) -> None:
+        self._classifier.lang = self._lang
+        self.state.found_categories = self._classifier.classify_all(
+            matches)
+
+        self._results_panel.show_results(
+            matches, self.state.found_categories)
+
+        sims = [m.get("sim", 0.0) for m in matches]
+        avg  = float(np.mean(sims)) * 100
+
+        self._stats_bar.set("patterns", str(len(matches)))
+        self._stats_bar.set("accuracy", f"{avg:.1f}%")
+        self._results_panel.update_counter(0, len(matches))
+        self._show_preview(0)
+
+        # ── Переводимая строка статуса ────────────────────────────────
+        try:
+            self._preview_panel.set_done_status(len(matches))
+        except Exception:
+            self._preview_panel.set_status(
+                f"{_S('done_found', self._lang)} "
+                f"{len(matches)} "
+                f"{_S('repeats', self._lang)}")
+
+        self._redraw_heatmap()
+
+    def _on_result_select(self, match_idx: int) -> None:
+        try:
+            self._show_preview(match_idx)
+        except Exception as e:
+            print(f"[ResultSelect] {e}")
+
+    def _on_preview_resize(self) -> None:
+        if self.state.matches:
+            self.root.after_idle(
+                lambda: self._show_preview(
+                    self.state.current_match))
+        if self.state.video_queue:
+            self.root.after_idle(self._redraw_heatmap)
+
+    def _on_timeline_click(self, event: tk.Event) -> None:
+        try:
+            if not self.state.matches:
+                return
+            cw = self._preview_panel.timeline_canvas.winfo_width()
+            if cw <= 0:
+                return
+
+            durations = [self._get_duration(p)
+                         for p in self.state.video_queue]
+            total_dur = sum(durations)
+            if total_dur <= 0:
+                return
+
+            view_start = self.state.timeline_pan * total_dur
+            view_span  = total_dur / self.state.timeline_zoom
+            clicked_t  = (view_start
+                          + (event.x / cw) * view_span)
+            starts     = np.cumsum([0.0] + durations[:-1])
+
+            best_i = min(
+                range(len(self.state.matches)),
+                key=lambda i: min(
+                    abs(clicked_t
+                        - (starts[self.state.matches[i]["v1_idx"]]
+                           + self.state.matches[i]["t1"])),
+                    abs(clicked_t
+                        - (starts[self.state.matches[i]["v2_idx"]]
+                           + self.state.matches[i]["t2"])),
+                ))
+            self._show_preview(best_i)
+        except Exception as e:
+            print(f"[TimelineClick] {e}")
+
+    # ── Превью ────────────────────────────────────────────────────────────
+
+    def _show_preview(self, index: int) -> None:
+        try:
+            if not self.state.matches:
+                return
+            index = max(0, min(index, len(self.state.matches) - 1))
+            self.state.current_match = index
+            m = self.state.matches[index]
+
+            pw, ph = self._preview_panel.get_preview_size()
+            pw, ph = max(10, pw - 4), max(10, ph - 4)
+
+            img1 = self._load_frame(m["v1_idx"], m["f1"], pw, ph)
+            img2 = self._load_frame(m["v2_idx"], m["f2"], pw, ph)
+
+            self._preview_panel.update_preview(
+                m, img1, img2, index, len(self.state.matches))
+            self._results_panel.update_counter(
+                index, len(self.state.matches))
+            self._results_panel.vlist.select_by_match_idx(index)
+        except Exception as e:
+            print(f"[ShowPreview] {e}")
+
+    def _load_frame(self, video_idx: int, frame_num: int,
+                    max_w: int = 520,
+                    max_h: int = 320) -> ImageTk.PhotoImage | None:
+        if (video_idx < 0
+                or video_idx >= len(self.state.video_queue)):
+            return None
+        path = self.state.video_queue[video_idx]
+
+        frame = self._frame_cache.get(
+            path, frame_num, max_w, max_h)
+
+        if frame is None:
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened():
+                return None
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+            ret, raw = cap.read()
+            cap.release()
+            if not ret or raw is None:
+                return None
+            h, w  = raw.shape[:2]
+            scale = min(max_w / max(w, 1),
+                        max_h / max(h, 1), 1.0)
+            nw    = max(1, int(w * scale))
+            nh    = max(1, int(h * scale))
+            frame = cv2.resize(raw, (nw, nh),
+                               interpolation=cv2.INTER_AREA)
+            self._frame_cache.put(
+                path, frame_num, max_w, max_h, frame)
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return ImageTk.PhotoImage(Image.fromarray(rgb))
+
+    def _get_duration(self, path: str) -> float:
+        if path in self.state.video_durations_cache:
+            return self.state.video_durations_cache[path]
         try:
             cap = cv2.VideoCapture(path)
             fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -1109,792 +1262,222 @@ class ParallelFinderApp:
             dur = frm / fps if fps > 0 else 0.0
             cap.release()
         except Exception:
-            pass
-        self.video_durations_cache[path] = dur
+            dur = 0.0
+        self.state.video_durations_cache[path] = dur
         return dur
 
-    def _fmt_num(self, n: int) -> str:
-        return f"{n / 1000:.1f}K" if n >= 1000 else str(n)
-
-    def _fmt_time(self, secs: float) -> str:
-        s = max(0.0, secs)
-        return f"{int(s // 60):02d}:{int(s % 60):02d}"
-
-    # Публичные алиасы для обратной совместимости
-    def _format_number(self, n):   return self._fmt_num(n)
-    def _format_time(self, s):     return self._fmt_time(s)
-
-    # ══════════════════════════════════════════════════════════════
-    # АНАЛИЗ
-    # ══════════════════════════════════════════════════════════════
-
-    def start_analysis(self):
-        if not self.video_queue:
-            messagebox.showwarning("Нет видео",
-                                   "Выберите видео или папку для анализа")
-            return
-        if self.analysis_running:
-            return  # Защита от двойного запуска
-
-        self.analysis_running = True
-        self.start_btn.config(state='disabled')
-        self.stop_btn.config(state='normal')
-        self._reset_state()
-        self.total_batch_videos = len(self.video_queue)
-        self.progress.start_animation()
-        Thread(target=self._run_analysis_pipeline, daemon=True).start()
-
-    def stop_analysis(self):
-        self.analysis_running = False
-        self.start_btn.config(state='normal')
-        self.stop_btn.config(state='disabled')
-        self.status_label.config(text="Остановлено")
-        self.progress.stop_animation()
-
-    def _run_analysis_pipeline(self):
+    def _get_frame_count(self, path: str) -> int:
         try:
-            all_poses_meta: list = []
-            all_poses_vecs: list = []
-
-            for idx, path in enumerate(self.video_queue):
-                if not self.analysis_running:
-                    break
-
-                self.current_batch_index = idx
-                self.root.after(
-                    0,
-                    lambda p=path, i=idx: self._update_batch_status(p, i)
-                )
-
-                poses_meta, poses_vecs = self._extract_poses_from_video(path)
-
-                for meta in poses_meta:
-                    meta['video_idx'] = idx
-
-                all_poses_meta.extend(poses_meta)
-                all_poses_vecs.extend(poses_vecs)
-
-            if not self.analysis_running or not all_poses_vecs:
-                self.root.after(0, self._on_analysis_complete)
-                return
-
-            self.poses_meta = all_poses_meta
-
-            # Всегда используем float32 для тензора поз —
-            # FP16 применяется только внутри YOLO-инференса
-            self.poses_tensor = torch.tensor(
-                np.array(all_poses_vecs, dtype=np.float32),
-                dtype=torch.float32,
-                device=self.yolo.device,
-            )
-
-            n_poses = len(self.poses_tensor)
-            self.root.after(0, lambda: self.status_label.config(
-                text=f"Поиск совпадений среди {n_poses} поз…"
-            ))
-
-            self.matches = self._find_matches_tensor_chunked()
-            self.root.after(0, self._on_analysis_complete)
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.root.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
-            self.root.after(0, self._on_analysis_complete)
-
-    def _update_batch_status(self, path: str, idx: int):
-        self.status_label.config(
-            text=f"{idx + 1}/{self.total_batch_videos}: "
-                 f"{os.path.basename(path)}"
-        )
-        self.metric_values['batch_progress'].set(
-            f"{idx + 1}/{self.total_batch_videos}"
-        )
-
-    # ── Извлечение поз из видео ───────────────────────────────────
-
-    def _extract_poses_from_video(self, path: str):
-        """
-        Извлечение поз из видео.
-
-        ИСПРАВЛЕНИЕ фриза: batch_size вычисляется ОДИН РАЗ перед циклом
-        по первому кадру, а не заново на каждой итерации.
-        Flush происходит ровно каждые batch_size кадров.
-        """
-        cap          = cv2.VideoCapture(path)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps          = cap.get(cv2.CAP_PROP_FPS) or 30.0
-
-        quality  = self.quality.get()
-        base_fps = {'Быстро': 8, 'Средне': 15, 'Макс': 30}.get(quality, 15)
-
-        # Читаем размер первого кадра для вычисления skip и batch_size
-        h_vid = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
-        w_vid = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))  or 1280
-
-        # Размер после возможного ресайза
-        target = 640
-        scale  = min(target / w_vid, target / h_vid, 1.0)
-        h_eff  = int(h_vid * scale)
-        w_eff  = int(w_vid * scale)
-
-        # Адаптивный skip на основе fps видео и желаемого fps анализа
-        pixel_load = (h_vid * w_vid * fps) / 1e6
-        res_factor = min(2.0, max(1.0, pixel_load / 50.0))
-        skip       = max(1, min(int((fps / base_fps) * res_factor), 15))
-
-        # batch_size вычисляем ОДИН РАЗ — нет фризов каждые N кадров
-        effective_batch = self.yolo.get_dynamic_batch_size(
-            [(h_eff, w_eff)] * 4,   # передаём несколько одинаковых для усреднения
-            self.BATCH_SIZE,
-        )
-        print(f"[Extract] {os.path.basename(path)} | "
-              f"skip={skip} | batch={effective_batch} | "
-              f"res={w_eff}x{h_eff}")
-
-        start_time        = time.time()
-        frame_idx         = 0
-        poses_meta: list  = []
-        poses_vecs: list  = []
-        batch_frames      = []
-        batch_meta_pre    = []
-        video_hash        = hashlib.md5(path.encode()).hexdigest()
-        use_bw            = self.use_body_weights.get()
-
-        while cap.isOpened() and self.analysis_running:
-            ret = cap.grab()
-            if not ret:
-                break
-
-            if frame_idx % skip == 0:
-                ret, frame = cap.retrieve()
-                if ret and frame is not None:
-                    # Ресайз до 640 только если нужно
-                    fh, fw = frame.shape[:2]
-                    s = min(target / fw, target / fh, 1.0)
-                    if s < 1.0:
-                        frame = cv2.resize(
-                            frame,
-                            (int(fw * s), int(fh * s)),
-                            interpolation=cv2.INTER_AREA,
-                        )
-
-                    batch_frames.append(frame)
-                    batch_meta_pre.append({
-                        'frame': frame_idx,
-                        'time':  frame_idx / fps,
-                    })
-
-                    # Flush только когда накопили ровно effective_batch кадров
-                    if len(batch_frames) >= effective_batch:
-                        self._flush_batch(
-                            batch_frames, batch_meta_pre,
-                            poses_meta, poses_vecs,
-                            video_hash, use_bw,
-                        )
-                        batch_frames.clear()
-                        batch_meta_pre.clear()
-
-            frame_idx += 1
-
-            # Обновление прогресса каждые 60 кадров
-            if frame_idx % 60 == 0 and total_frames > 0:
-                pct     = (frame_idx / total_frames) * 100.0
-                elapsed = time.time() - start_time
-                speed   = frame_idx / elapsed if elapsed > 0 else 1.0
-                total_work = total_frames * len(self.video_queue)
-                done_work  = (frame_idx
-                              + self.current_batch_index * total_frames)
-                remaining  = max(
-                    0.0, (total_work - done_work) / speed
-                ) if speed > 0 else 0.0
-                self.root.after(
-                    0,
-                    lambda p=pct, r=remaining,
-                           cf=frame_idx, tf=total_frames:
-                    self._update_progress(p, r, cf, tf),
-                )
-
-        # Остаток батча (< effective_batch кадров)
-        if batch_frames and self.analysis_running:
-            self._flush_batch(
-                batch_frames, batch_meta_pre,
-                poses_meta, poses_vecs,
-                video_hash, use_bw,
-            )
-
-        cap.release()
-        print(f"[Extract] Готово: {len(poses_meta)} поз из "
-              f"{frame_idx} кадров")
-        return poses_meta, poses_vecs
-
-    def _flush_batch(self, batch_frames, batch_meta_pre,
-                     poses_meta, poses_vecs, video_hash, use_bw):
-        """Обработка накопленного батча кадров YOLO и препроцессинг поз."""
-        poses_data = self.yolo.detect_batch(batch_frames)
-        for pose_data, meta in zip(poses_data, batch_meta_pre):
-            if pose_data is None:
-                continue
-            kps = pose_data['keypoints']
-            if kps.shape[0] < 17:
-                continue
-
-            vec = self._preprocess_pose(pose_data, use_bw)
-            poses_meta.append({
-                't':   meta['time'],
-                'f':   meta['frame'],
-                'dir': pose_data.get('direction', 'forward'),
-                'vec': vec.reshape(17, 2),
-            })
-            poses_vecs.append(vec.flatten())
-
-    def _preprocess_pose(self, pose_data: dict,
-                         use_body_weights: bool = False) -> np.ndarray:
-        """
-        Нормализация позы.
-        Если use_body_weights=True — применяет весовую схему по частям тела.
-        """
-        kps      = pose_data['keypoints'][:17, :2].astype(np.float32)
-        center   = np.mean(kps, axis=0)
-        centered = kps - center
-        scale    = np.max(np.abs(centered)) + 1e-5
-        normed   = centered / scale
-
-        if use_body_weights:
-            from core.matcher import MotionMatcher
-            weights = MotionMatcher.BODY_WEIGHTS[:, None]
-            normed  = normed * weights
-            s2 = np.max(np.abs(normed)) + 1e-5
-            normed = normed / s2
-
-        return normed  # (17, 2)
-
-    # ── Матричный поиск совпадений ────────────────────────────────
-
-    def _find_matches_tensor_chunked(self) -> list:
-        """
-        Поиск похожих поз с чанкованием и дедупликацией.
-
-        Изменения:
-        - Шаг чанка = chunk_size - overlap (правильное скользящее окно).
-        - Дедупликация учитывает video_idx.
-        - junk_ratio берётся из авто-настроенного self._junk_ratio.
-        - Тензор всегда float32 (стабильнее для косинусного сходства).
-        """
-        if self.poses_tensor is None or len(self.poses_tensor) < 10:
-            return []
-
-        device  = self.yolo.device
-        thresh  = self.threshold.get() / 100.0
-        min_gap = self.scene_interval.get()
-
-        n = len(self.poses_tensor)
-        print(f"\nПоиск среди {n} поз | порог={thresh} | интервал={min_gap}с")
-
-        # Нормируем один раз, float32
-        V = self.poses_tensor.to(dtype=torch.float32, device=device)
-        V = V.view(n, -1)
-        V = F.normalize(V, p=2, dim=1)
-
-        # Зеркальная версия (опционально)
-        V_mirror = None
-        if self.use_mirror_invariance.get():
-            from core.matcher import MotionMatcher
-            V_mirror = MotionMatcher._mirror_vector(V)
-            V_mirror = F.normalize(V_mirror, p=2, dim=1)
-
-        times = torch.tensor(
-            [m['t'] for m in self.poses_meta],
-            dtype=torch.float32, device=device,
-        )
-
-        raw_matches:   list = []
-        chunk_size     = self.CHUNK_SIZE
-        overlap        = self.CHUNK_OVERLAP
-        max_per_chunk  = self.max_matches_per_chunk
-        max_total      = self.max_total_matches
-
-        effective_step = max(1, chunk_size - overlap)
-        n_chunks       = (n + effective_step - 1) // effective_step
-
-        for chunk_idx in range(n_chunks):
-            start = chunk_idx * effective_step
-            end   = min(start + chunk_size, n)
-            if start >= n:
-                break
-
-            if not self.analysis_running:
-                break
-            if len(raw_matches) >= max_total:
-                print(f"Достигнут глобальный лимит ({max_total:,}), стоп.")
-                break
-
-            V_chunk = V[start:end]
-            T_chunk = times[start:end]
-
-            sim = torch.mm(V_chunk, V.t())
-
-            if V_mirror is not None:
-                sim_m = torch.mm(V_chunk, V_mirror.t())
-                sim   = torch.maximum(sim, sim_m)
-                del sim_m
-
-            time_diff = torch.abs(T_chunk.unsqueeze(1) - times.unsqueeze(0))
-
-            col_idx = torch.arange(n, device=device).unsqueeze(0)
-            row_idx = torch.arange(start, end, device=device).unsqueeze(1)
-            upper   = col_idx > row_idx
-
-            valid = (sim >= thresh) & (time_diff >= min_gap) & upper
-
-            indices_t = torch.nonzero(valid, as_tuple=False)
-            scores_t  = sim[valid]
-
-            # Переносим на CPU за один раз
-            indices = indices_t.cpu().numpy()
-            scores  = scores_t.cpu().numpy()
-
-            del sim, time_diff, upper, valid, indices_t, scores_t
-            if device == 'cuda':
-                torch.cuda.empty_cache()
-            gc.collect()
-
-            limit = min(len(indices), max_per_chunk)
-            for k in range(limit):
-                if len(raw_matches) >= max_total:
-                    break
-                i_local = int(indices[k, 0])
-                j       = int(indices[k, 1])
-                i       = start + i_local
-
-                raw_matches.append({
-                    'm1_idx':    i,
-                    'm2_idx':    j,
-                    't1':        self.poses_meta[i]['t'],
-                    't2':        self.poses_meta[j]['t'],
-                    'f1':        self.poses_meta[i]['f'],
-                    'f2':        self.poses_meta[j]['f'],
-                    'v1_idx':    self.poses_meta[i].get('video_idx', 0),
-                    'v2_idx':    self.poses_meta[j].get('video_idx', 0),
-                    'sim':       float(scores[k]),
-                    'direction': self.poses_meta[i].get('dir', 'forward'),
-                })
-
-            print(f"Чанк {chunk_idx + 1}/{n_chunks} [{start}:{end}]: "
-                  f"+{limit} пар (всего {len(raw_matches):,})")
-
-        print(f"Сырых совпадений: {len(raw_matches):,}")
-        if not raw_matches:
-            return []
-
-        return self._deduplicate_matches(raw_matches)
-
-    def _deduplicate_matches(self, matches: list) -> list:
-        """
-        Жадная дедупликация с бинарным поиском (O(n log n) вместо O(n²)).
-
-        - Сортируем по убыванию sim.
-        - Делим на хорошие (>= 0.85) и мусор.
-        - Из мусора берём junk_ratio.
-        - Жадный фильтр с учётом video_idx.
-        """
-        matches.sort(key=lambda x: x['sim'], reverse=True)
-
-        junk_ratio = getattr(self, '_junk_ratio', 0.20)
-        good       = [m for m in matches if m['sim'] >= 0.85]
-        junk       = [m for m in matches if m['sim'] <  0.85]
-        junk_take  = int(len(junk) * junk_ratio)
-        selected   = good + junk[:junk_take]
-
-        print(f"Хороших (>=0.85): {len(good):,} | "
-              f"мусора (<0.85): {len(junk):,} (взято {junk_take:,})")
-        print(f"На дедупликацию: {len(selected):,}")
-
-        min_gap    = self.match_gap.get()
-        max_unique = getattr(self, '_max_unique_results', 1000)
-
-        # Словарь {video_idx: sorted list of used times}
-        # Бинарный поиск: O(log n) вместо O(n) перебора
-        used_times: dict = {}
-
-        def _is_close(vid: int, t: float) -> bool:
-            arr = used_times.get(vid)
-            if not arr:
-                return False
-            idx = bisect.bisect_left(arr, t)
-            if idx < len(arr) and abs(arr[idx] - t) < min_gap:
-                return True
-            if idx > 0 and abs(arr[idx - 1] - t) < min_gap:
-                return True
-            return False
-
-        def _mark_used(vid: int, t: float):
-            if vid not in used_times:
-                used_times[vid] = []
-            bisect.insort(used_times[vid], t)
-
-        unique: list = []
-
-        for m in selected:
-            t1, t2 = m['t1'], m['t2']
-            v1, v2 = m['v1_idx'], m['v2_idx']
-
-            if _is_close(v1, t1) or _is_close(v2, t2):
-                continue
-
-            unique.append(m)
-            _mark_used(v1, t1)
-            _mark_used(v2, t2)
-
-            if len(unique) >= max_unique:
-                break
-
-        print(f"Уникальных после дедупликации: {len(unique)}")
-        return unique
-
-    # ══════════════════════════════════════════════════════════════
-    # ЗАВЕРШЕНИЕ И ОТОБРАЖЕНИЕ
-    # ══════════════════════════════════════════════════════════════
-
-    def _on_analysis_complete(self):
-        self.analysis_running = False
-        self.start_btn.config(state='normal')
-        self.stop_btn.config(state='disabled')
-        self.progress.stop_animation()
-
-        if self.matches:
-            self.status_label.config(
-                text=f"Готово. Найдено {len(self.matches)} повторов")
-            self._display_results()
-            self._draw_heatmap()
-        else:
-            self.status_label.config(
-                text="Повторений не найдено. Попробуйте снизить порог")
-            self.results_list.delete(0, tk.END)
-            self.results_list.insert(tk.END, "Повторений не найдено")
-
-        self.progress.set(100)
-        self.progress_label.config(text="100%")
-        self.metric_values['time_left'].set("00:00")
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
-
-    def _update_progress(self, percent: float, remaining: float,
-                          current_frames: int, total_frames: int):
-        self.progress.set(percent)
-        self.progress_label.config(text=f"{percent:.0f}%")
-        self.metric_values['frames'].set(
-            f"{self._fmt_num(current_frames)}/{self._fmt_num(total_frames)}")
-        self.metric_values['time_left'].set(self._fmt_time(remaining))
-
-    def _display_results(self):
-        self.results_list.delete(0, tk.END)
-        if not self.matches:
-            return
-
-        arrow_map = {"left": "←", "right": "→", "forward": "↑",
-                     "unknown": "?"}
-
-        for m in self.matches:
-            t1    = self._fmt_time(m['t1'])
-            t2    = self._fmt_time(m['t2'])
-            d     = m.get('direction', 'forward')
-            arrow = arrow_map.get(d, "")
-
-            if self.batch_mode:
-                v1 = os.path.basename(
-                    self.video_queue[m['v1_idx']])[:14]
-                v2 = os.path.basename(
-                    self.video_queue[m['v2_idx']])[:14]
-                display = (f"{arrow} {v1} ({t1}) ↔ "
-                           f"{v2} ({t2})  {m['sim']:.0%}")
-            else:
-                display = f"{arrow} {t1} → {t2}  {m['sim']:.0%}"
-
-            self.results_list.insert(tk.END, display)
-
-        self.metric_values['patterns'].set(str(len(self.matches)))
-        avg_sim = np.mean([m['sim'] for m in self.matches]) * 100
-        self.metric_values['accuracy'].set(f"{avg_sim:.0f}%")
-
-        self._show_preview(0)
-
-    def _draw_heatmap(self):
-        self.timeline_canvas.delete("all")
-        if not self.matches or not self.video_queue:
-            return
-
-        self.timeline_canvas.update_idletasks()
-        canvas_w = self.timeline_canvas.winfo_width() or 800
-
-        video_durations = [self._get_video_duration(p)
-                           for p in self.video_queue]
-        total_duration  = sum(video_durations)
-        if total_duration <= 0:
-            return
-
-        # Разделители файлов
-        cumulative = 0.0
-        for i, dur in enumerate(video_durations):
-            if i > 0:
-                x = (cumulative / total_duration) * canvas_w
-                self.timeline_canvas.create_line(
-                    x, 0, x, 40, fill=self.colors['border'], width=1)
-            cumulative += dur
-
-        start_times = np.cumsum([0.0] + video_durations[:-1])
-
-        for m in self.matches:
-            sim = m['sim']
-            x1  = ((start_times[m['v1_idx']] + m['t1']) / total_duration) * canvas_w
-            x2  = ((start_times[m['v2_idx']] + m['t2']) / total_duration) * canvas_w
-
-            # Цвет: от синего (слабое) к красному (сильное)
-            intensity = max(0.0, (sim - 0.7) / 0.3)
-            r = int(90  + 165 * intensity)
-            g = int(80  +  95 * intensity)
-            b = int(255 - 100 * intensity)
-            color = f"#{r:02x}{g:02x}{b:02x}"
-
-            self.timeline_canvas.create_line(
-                x1, 0, x1, 40, fill=color, width=2)
-            self.timeline_canvas.create_line(
-                x2, 0, x2, 40, fill=color, width=2)
-
-    def _show_preview(self, index: int):
-        if not self.matches:
-            return
-        if not (0 <= index < len(self.matches)):
-            return
-
-        self.current_match = index
-        m = self.matches[index]
-
-        self.time1_label.config(text=self._fmt_time(m['t1']))
-        self.time2_label.config(text=self._fmt_time(m['t2']))
-
-        d     = m.get('direction', 'forward')
-        arrow = {"left": "←", "right": "→", "forward": "↑",
-                 "unknown": "?"}.get(d, "")
-        self.match_info.config(text=f"{arrow} {d} • {m['sim']:.0%}")
-        self.action1_label.config(text=d)
-        self.action2_label.config(text=d)
-        self.match_counter.config(
-            text=f"{index + 1}/{len(self.matches)}")
-
-        img1 = self._load_frame_with_cache(m['v1_idx'], m['f1'])
-        img2 = self._load_frame_with_cache(m['v2_idx'], m['f2'])
-
-        if img1:
-            self.preview1.config(image=img1)
-            self.preview1.image = img1
-        if img2:
-            self.preview2.config(image=img2)
-            self.preview2.image = img2
-
-        self.results_list.selection_clear(0, tk.END)
-        self.results_list.selection_set(index)
-        self.results_list.see(index)
-
-    def _load_frame_with_cache(self, video_idx: int,
-                                frame_num: int) -> 'ImageTk.PhotoImage | None':
-        """Загрузить кадр из видео с дисковым кешом."""
-        if video_idx < 0 or video_idx >= len(self.video_queue):
-            return None
-
-        video_path = self.video_queue[video_idx]
-        video_hash = hashlib.md5(video_path.encode()).hexdigest()
-        cache_path = os.path.join(
-            self.preview_cache_dir, f"{video_hash}_{frame_num}.jpg")
-
-        frame = None
-        if os.path.exists(cache_path):
-            frame = cv2.imread(cache_path)
-
-        if frame is None:
-            cap = cv2.VideoCapture(video_path)
-            if cap.isOpened():
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-                ret, raw = cap.read()
-                cap.release()
-                if ret and raw is not None:
-                    max_w, max_h = 520, 320
-                    h, w = raw.shape[:2]
-                    scale = min(max_w / w, max_h / h)
-                    new_w, new_h = int(w * scale), int(h * scale)
-                    frame = cv2.resize(raw, (new_w, new_h),
-                                       interpolation=cv2.INTER_AREA)
-                    cv2.imwrite(cache_path, frame,
-                                [cv2.IMWRITE_JPEG_QUALITY, 82])
-
-        if frame is not None:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            return ImageTk.PhotoImage(Image.fromarray(rgb))
-        return None
-
-    # ══════════════════════════════════════════════════════════════
-    # НАВИГАЦИЯ И СОБЫТИЯ
-    # ══════════════════════════════════════════════════════════════
-
-    def on_select(self, event):
-        sel = self.results_list.curselection()
-        if sel:
-            self._show_preview(sel[0])
-
-    def on_timeline_click(self, event):
-        if not self.matches or not self.video_queue:
-            return
-
-        canvas_w = self.timeline_canvas.winfo_width()
-        if canvas_w <= 0:
-            return
-
-        video_durations = [self._get_video_duration(p)
-                           for p in self.video_queue]
-        total_duration  = sum(video_durations)
-        if total_duration <= 0:
-            return
-
-        clicked_time = (event.x / canvas_w) * total_duration
-        start_times  = np.cumsum([0.0] + video_durations[:-1])
-
-        closest_idx = -1
-        min_dist    = float('inf')
-
-        for i, m in enumerate(self.matches):
-            m_t1 = start_times[m['v1_idx']] + m['t1']
-            m_t2 = start_times[m['v2_idx']] + m['t2']
-            dist = min(abs(clicked_time - m_t1), abs(clicked_time - m_t2))
-            if dist < min_dist:
-                min_dist    = dist
-                closest_idx = i
-
-        if closest_idx != -1:
-            self._show_preview(closest_idx)
-
-    def prev_match(self):
-        if self.current_match > 0:
-            self._show_preview(self.current_match - 1)
-
-    def next_match(self):
-        if self.current_match < len(self.matches) - 1:
-            self._show_preview(self.current_match + 1)
-
-    # ══════════════════════════════════════════════════════════════
-    # ЭКСПОРТ
-    # ══════════════════════════════════════════════════════════════
-
-    def export_json(self):
-        if not self.matches:
-            messagebox.showwarning("Нет данных", "Нет данных для экспорта")
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            filetypes=[("JSON", "*.json")],
-        )
-        if not path:
-            return
-
-        clean = []
-        for m in self.matches:
-            row = m.copy()
-            row.pop('vec', None)   # убираем тяжёлые данные
-            clean.append(row)
-
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump({'matches': clean}, f, indent=2, ensure_ascii=False)
-        messagebox.showinfo("Экспорт", f"JSON сохранён:\n{path}")
-
-    def export_txt(self):
-        if not self.matches:
-            messagebox.showwarning("Нет данных", "Нет данных для экспорта")
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("Text File", "*.txt")],
-        )
-        if not path:
-            return
-
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write("PARALLEL FINDER — РЕЗУЛЬТАТЫ\n" + "=" * 44 + "\n")
-            for i, m in enumerate(self.matches):
-                v1 = os.path.basename(self.video_queue[m['v1_idx']])
-                v2 = os.path.basename(self.video_queue[m['v2_idx']])
-                f.write(
-                    f"{i + 1:03d}. {m['sim']:.1%} | "
-                    f"{v1} @ {self._fmt_time(m['t1'])} ↔ "
-                    f"{v2} @ {self._fmt_time(m['t2'])}\n"
-                )
-        messagebox.showinfo("Экспорт", f"TXT сохранён:\n{path}")
-
-    def export_edl(self):
-        if not self.matches:
-            messagebox.showwarning("Нет данных", "Нет данных для экспорта в EDL")
-            return
-
-        path = filedialog.asksaveasfilename(
-            defaultextension=".edl",
-            filetypes=[("Edit Decision List", "*.edl")],
-        )
-        if not path:
-            return
-
-        try:
-            cap = cv2.VideoCapture(self.video_queue[0])
-            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            cap = cv2.VideoCapture(path)
+            frm = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             cap.release()
+            return frm
         except Exception:
-            fps = 30.0
+            return 0
 
-        def timecode(seconds: float) -> str:
-            s   = max(0.0, seconds)
-            h   = int(s / 3600)
-            m   = int((s % 3600) / 60)
-            sec = int(s % 60)
-            fr  = int((s - int(s)) * fps)
-            return f"{h:02d}:{m:02d}:{sec:02d}:{fr:02d}"
+    def _redraw_heatmap(self) -> None:
+        try:
+            if not self.state.video_queue:
+                return
+            durations = [self._get_duration(p)
+                         for p in self.state.video_queue]
+            self._preview_panel.draw_heatmap(durations)
+        except Exception as e:
+            print(f"[Heatmap] {e}")
 
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write("TITLE: Parallel Finder Export\nFCM: NON-DROP FRAME\n\n")
-            timeline = 3600.0
-            for i, m in enumerate(self.matches):
-                clip1 = os.path.basename(self.video_queue[m['v1_idx']])
-                clip2 = os.path.basename(self.video_queue[m['v2_idx']])
+    # ── Язык ──────────────────────────────────────────────────────────────
 
-                f.write(
-                    f"{i * 2 + 1:03d}  AX       V     C        "
-                    f"{timecode(m['t1'])} {timecode(m['t1'] + 2)} "
-                    f"{timecode(timeline)} {timecode(timeline + 2)}\n"
-                )
-                f.write(f"* FROM CLIP NAME: {clip1}\n")
+    def _toggle_language(self) -> None:
+        langs      = list(SUPPORTED_LANGUAGES)
+        self._lang = langs[
+            (langs.index(self._lang) + 1) % len(langs)]
 
-                f.write(
-                    f"{i * 2 + 2:03d}  AX       V     C        "
-                    f"{timecode(m['t2'])} {timecode(m['t2'] + 2)} "
-                    f"{timecode(timeline + 2)} {timecode(timeline + 4)}\n"
-                )
-                f.write(f"* FROM CLIP NAME: {clip2}\n\n")
-                timeline += 5.0
+        # Топбар
+        self._lang_btn.set_text(self._lang.upper())
+        self._models_btn.set_text(_S("models_btn", self._lang))
 
-        messagebox.showinfo("Экспорт", f"EDL сохранён:\n{path}")
+        # Оверлей
+        try:
+            self._overlay.set_lang(self._lang)
+        except Exception:
+            pass
 
-    # ══════════════════════════════════════════════════════════════
-    # ЗАПУСК
-    # ══════════════════════════════════════════════════════════════
+        # Все панели
+        for panel in (self._stats_bar,
+                      self._preview_panel,
+                      self._results_panel,
+                      self._settings_panel):
+            try:
+                panel.set_lang(self._lang)
+            except Exception:
+                pass
 
-    def run(self):
+        try:
+            self._source_panel.set_lang(self._lang)
+        except Exception:
+            pass
+
+        ConfigManager.set_language(self._lang)
+
+        # Перелокализуем матчи и UI без повторной классификации
+        if self.state.matches:
+            self._classifier.lang = self._lang
+
+            # relabel использует сохранённые _cat_key
+            self.state.found_categories = (
+                self._classifier.relabel_all(self.state.matches))
+
+            # Обновляем список и превью
+            self._results_panel.show_results(
+                self.state.matches,
+                self.state.found_categories)
+
+            # Обновляем превью текущего матча
+            try:
+                self._show_preview(self.state.current_match)
+            except Exception:
+                pass
+
+            # Обновляем строку статуса
+            try:
+                self._preview_panel.set_done_status(
+                    len(self.state.matches))
+            except Exception:
+                pass
+
+    # ── Fullscreen ────────────────────────────────────────────────────────
+
+    def _toggle_fullscreen(self) -> None:
+        self._fullscreen = not self._fullscreen
+        self.root.attributes("-fullscreen", self._fullscreen)
+
+    def _exit_fullscreen(self) -> None:
+        if self._fullscreen:
+            self._fullscreen = False
+            self.root.attributes("-fullscreen", False)
+
+    # ── Drag & Drop ───────────────────────────────────────────────────────
+
+    def _setup_drag_drop(self) -> None:
+        if not _DND_AVAILABLE:
+            return
+        try:
+            self.root.drop_target_register(DND_FILES)
+            self.root.dnd_bind("<<Drop>>", self._on_dnd_drop)
+        except Exception as e:
+            print(f"[DnD] {e}")
+
+    def _on_dnd_drop(self, event: tk.Event) -> None:
+        import re
+        raw   = event.data
+        paths = re.findall(r"\{([^}]+)\}", raw) if "{" in raw else []
+        paths += (re.sub(r"\{[^}]+\}", "", raw).split()
+                  if "{" in raw else raw.split())
+        valid = [p for p in paths
+                 if os.path.isfile(p) and is_video_file(p)]
+        if valid:
+            self._source_panel.add_to_queue(valid)
+
+    # ── Трей ──────────────────────────────────────────────────────────────
+
+    def _create_tray(self) -> None:
+        if not TRAY_AVAILABLE:
+            return
+        try:
+            tray_path = (Path(__file__).parent.parent
+                         / "icons" / "tray_icon.png")
+            image = (PILImage.open(tray_path)
+                     if tray_path.exists()
+                     else PILImage.new("RGB", (64, 64), "#3b82f6"))
+            menu = pystray.Menu(
+                pystray.MenuItem("Показать", self._show_window),
+                pystray.MenuItem("Скрыть",   self._hide_window),
+                pystray.MenuItem("Выход",    self._quit),
+            )
+            self._tray_icon = pystray.Icon(
+                "parallel_finder", image,
+                APP_DISPLAY_NAME, menu)
+            self._tray_icon.run_detached()
+        except Exception as e:
+            print(f"[Tray] {e}")
+
+    def _show_window(self) -> None:
+        self.root.after(0, lambda: (
+            self.root.deiconify(),
+            self.root.lift(),
+            self.root.focus_force()))
+
+    def _hide_window(self) -> None:
+        self.root.withdraw()
+
+    def _hide_to_tray(self) -> None:
+        if TRAY_AVAILABLE and self._tray_icon:
+            self._hide_window()
+        else:
+            self._quit()
+
+    def _quit(self) -> None:
+        self.state.analysis_running = False
+
+        if self.backend:
+            try:
+                self.backend.stop_analysis()
+            except Exception:
+                pass
+
+        for proc in list(self._child_procs):
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._child_procs.clear()
+
+        if platform.system() == "Windows":
+            try:
+                for proc in psutil.process_iter(["pid", "name"]):
+                    if "powershell" in (
+                            proc.info.get("name") or "").lower():
+                        try:
+                            psutil.Process(
+                                proc.info["pid"]).terminate()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        if self._tray_icon:
+            try:
+                self._tray_icon.stop()
+            except Exception:
+                pass
+            self._tray_icon = None
+
+        try:
+            self.root.quit()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+    def run(self) -> None:
         self.root.mainloop()
 
 
-# ══════════════════════════════════════════════════════════════════════
+# ── Точка входа ───────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     try:
-        app = ParallelFinderApp()
-        app.run()
-    except Exception as e:
+        ParallelFinderApp().run()
+    except Exception as exc:
         import traceback
         traceback.print_exc()
-        messagebox.showerror("Критическая ошибка", str(e))
+        try:
+            messagebox.showerror("Критическая ошибка", str(exc))
+        except Exception:
+            pass

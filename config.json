@@ -1,6 +1,22 @@
 {
+  "_readme": "Parallel Finder Alpha v13 — main configuration file. Do not add comments inside JSON.",
+  "app": {
+    "display_name": "Parallel Finder Alpha v13",
+    "short_version": "Alpha v13",
+    "build_version": "v13.0.2.1",
+    "author": "Pozit1vchic",
+    "first_run": true,
+    "last_opened_project": null
+  },
+  "language": {
+    "current": "en",
+    "available": [
+      "ru",
+      "en"
+    ],
+    "time_format": "HH:MM:SS"
+  },
   "ui": {
-    "language": "ru",
     "theme": "dark",
     "style": "comfortable",
     "accent": "blue",
@@ -11,36 +27,205 @@
     "background_style": "subtle",
     "background_intensity": 55,
     "animation_speed": "slow",
-    "card_opacity": 95,
     "animations_enabled": false,
     "hover_effects_enabled": true,
-    "autosave": true
+    "card_opacity": 95,
+    "autosave": true,
+    "autosave_interval_ms": 300000,
+    "show_tooltips": true,
+    "confirm_on_stop": false,
+    "remember_window_size": true,
+    "window_width": 1600,
+    "window_height": 960
   },
   "preview": {
     "scale": 1.0,
     "quality": "low",
     "view_mode": "fit",
-    "overlay_opacity": 40
+    "overlay_opacity": 40,
+    "size_w": 320,
+    "size_h": 180,
+    "jpeg_quality": 80,
+    "show_skeleton": false,
+    "show_keypoints": false,
+    "show_confidence": false,
+    "show_direction": true,
+    "show_similarity": true
   },
   "analysis": {
-    "threshold": 75,
-    "repeat_length": 3,
-    "min_gap": 5,
-    "quality": "balanced"
+    "threshold": 87,
+    "min_gap": 6,
+    "quality": "maximum",
+    "use_mirror": true,
+    "use_body_weights": false,
+    "scale_norm": true,
+    "batch_size": 64,
+    "max_unique_results": 100,
+    "chunk_size": 2999,
+    "chunk_overlap": 300,
+    "good_threshold": 0.88,
+    "kp_vis_threshold": 0.4,
+    "min_kp_confidence": 0.4,
+    "min_anchor_confidence": 0.5,
+    "match_gap": 6,
+    "scene_interval": 3
   },
-  "language": "ru",
-  "theme": "dark",
-  "ui_style": "comfortable",
-  "accent_color": "blue",
-  "font_family": "28 Days Later Cyr",
-  "ui_scale": 100,
-  "density": "comfortable",
-  "background_type": "static",
-  "background_style": "dark_gradient",
-  "background_intensity": 55,
-  "animation_speed": 50,
-  "card_opacity": 95,
-  "animations_enabled": false,
-  "hover_effects": false,
-  "auto_save": false
+  "models": {
+    "default_model": "yolo11x-pose.pt",
+    "models_dir": "models",
+    "use_local_first": true,
+    "auto_download": true,
+    "redownload_on_corruption": true,
+    "fp16": true,
+    "imgsz": 640,
+    "conf": 0.25,
+    "warmup_runs": 3,
+    "available": [
+      "yolov8n-pose.pt",
+      "yolov8s-pose.pt",
+      "yolov8m-pose.pt",
+      "yolov8l-pose.pt",
+      "yolov8x-pose.pt",
+      "yolov8x-pose-p6.pt",
+      "yolo11n-pose.pt",
+      "yolo11s-pose.pt",
+      "yolo11m-pose.pt",
+      "yolo11l-pose.pt",
+      "yolo11x-pose.pt",
+      "yolo26n-pose.pt",
+      "yolo26s-pose.pt",
+      "yolo26m-pose.pt",
+      "yolo26l-pose.pt",
+      "yolo26x-pose.pt"
+    ]
+  },
+  "export": {
+    "default_format": "json",
+    "available_formats": [
+      "json",
+      "txt",
+      "edl",
+      "csv"
+    ],
+    "export_dir": null,
+    "include_thumbnails": false,
+    "include_poses_meta": false,
+    "include_motion_groups": true,
+    "confirmed_only": false,
+    "filtered_only": false,
+    "edl_frame_rate": 25.0,
+    "json_indent": 2,
+    "csv_delimiter": ",",
+    "txt_time_format": "HH:MM:SS:FF"
+  },
+  "filters": {
+    "sort_by": "similarity",
+    "sort_order": "desc",
+    "sort_options": [
+      "similarity",
+      "time_first",
+      "time_second",
+      "motion_type"
+    ],
+    "hide_rejected": false,
+    "min_similarity": 0,
+    "max_similarity": 100,
+    "show_directions": [
+      "forward",
+      "left",
+      "right",
+      "unknown"
+    ],
+    "show_motion_groups": true,
+    "show_only_confirmed": false
+  },
+  "person_search": {
+    "enabled": false,
+    "mode": "pose",
+    "available_modes": [
+      "pose",
+      "face",
+      "full_body"
+    ],
+    "top_k": 20,
+    "similarity_threshold": 0.75,
+    "use_mirror": true,
+    "paste_from_clipboard": true,
+    "drag_drop_enabled": true,
+    "max_query_images": 2
+  },
+  "motion_categories": {
+    "enabled": true,
+    "group_by_direction": true,
+    "group_by_similarity_band": true,
+    "similarity_bands": {
+      "high": 0.9,
+      "mid": 0.8
+    },
+    "directions": {
+      "forward": true,
+      "left": true,
+      "right": true,
+      "unknown": true
+    }
+  },
+  "overlay": {
+    "show_on_model_download": true,
+    "show_on_model_load": true,
+    "blur_radius": 8,
+    "blur_enabled": true,
+    "show_progress_bar": true,
+    "show_status_text": true,
+    "show_source_badge": true,
+    "background_opacity": 180
+  },
+  "video": {
+    "drag_drop_enabled": true,
+    "multi_select_enabled": true,
+    "max_videos": 16,
+    "supported_extensions": [
+      ".mp4",
+      ".avi",
+      ".mkv",
+      ".mov",
+      ".wmv",
+      ".flv",
+      ".webm",
+      ".mpeg",
+      ".mpg",
+      ".m4v",
+      ".3gp",
+      ".ts",
+      ".m2ts",
+      ".mts",
+      ".divx",
+      ".vob"
+    ],
+    "show_duration": true,
+    "show_frame_count": true,
+    "show_total_duration": true,
+    "adaptive_skip": true,
+    "max_skip": 10,
+    "base_fps_fast": 10,
+    "base_fps_medium": 15,
+    "base_fps_max": 30,
+    "resize_before_detect": true,
+    "detect_imgsz": 640
+  },
+  "cache": {
+    "poses_cache_enabled": true,
+    "preview_cache_enabled": true,
+    "results_cache_enabled": false,
+    "max_preview_cache_mb": 512,
+    "max_pose_cache_mb": 256,
+    "auto_clear_on_start": false
+  },
+  "logging": {
+    "enabled": false,
+    "level": "INFO",
+    "log_to_file": false,
+    "log_dir": null,
+    "max_log_size_mb": 10,
+    "backup_count": 3
+  }
 }
