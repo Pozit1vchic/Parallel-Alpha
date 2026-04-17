@@ -701,6 +701,7 @@ class AnalysisBackend:
                     base_progress_start = v_idx / n_videos * 70.0,
                     base_progress_end   = (v_idx + 1) / n_videos * 70.0,
                 )
+
                 all_frames_data.extend(frames_data)
                 if vmeta:
                     video_metas.append(vmeta)
@@ -822,6 +823,11 @@ class AnalysisBackend:
         base_progress_start: float = 0.0,
         base_progress_end:   float = 70.0,
     ) -> tuple[list[dict], VideoMeta | None]:
+        
+        import time
+        _perf_t_last = [time.perf_counter()]  # список, чтобы менять внутри _flush_batch
+        _perf_frame_count = [0]               # список
+
         """
         Извлекает позы из видео с оптимизацией памяти и корректным ETA.
         
@@ -848,20 +854,15 @@ class AnalysisBackend:
                 width=width, height=height,
             )
 
-            # Адаптивный skip (формула оставлена как есть для совместимости)
-            base_fps   = QUALITY_FPS[quality]
-            pixel_load = (height * width * fps) / 1e6
-            res_factor = min(2.0, max(0.5, pixel_load / 50.0))
-            skip       = min(
-                max(1, int((fps / base_fps) * res_factor)),
-                MAX_ADAPTIVE_SKIP,
-            )
+            # Упрощённая формула skip
+            target_fps = QUALITY_FPS[quality]
+            skip = max(1, round(fps / target_fps))
 
             scale     = min(MAX_FRAME_SIDE / max(width, 1),
                             MAX_FRAME_SIDE / max(height, 1), 1.0)
             scaled_w  = max(1, int(width  * scale))
             scaled_h  = max(1, int(height * scale))
-            dyn_batch = getattr(self.yolo, 'BATCH_SIZE_GPU', 64) if self.yolo.device == 'cuda' else getattr(self.yolo, 'BATCH_SIZE_CPU', 16)
+            dyn_batch = self.yolo.get_batch_size()
 
             # Исправлено: хэш по содержимому файла
             video_hash = _compute_file_hash(path)
@@ -877,21 +878,36 @@ class AnalysisBackend:
             batch_frame_ids: list[int]        = []
             frame_idx        = 0
 
+            _ui_update_interval = 0.2
+            _last_ui_update = time.perf_counter()
+
             def _flush_batch(
                 bf:   list[np.ndarray],
                 bids: list[int],
             ) -> None:
+                
+                _perf_frame_count[0] += len(batch_frames)
+                if _perf_frame_count[0] >= 100:
+                    t_now = time.perf_counter()
+                    dt = t_now - _perf_t_last[0]
+                    if dt > 0.5:
+                        print(f"[PERF] Кадр {frame_idx}: {dt:.2f}s на последние 100 кадров (batch={dyn_batch})")
+                    _perf_t_last[0] = t_now
+                    _perf_frame_count[0] = 0
                 """
                 Обрабатывает батч кадров.
                 
                 Исправлено:
                 - Убран параметр braw (raw_frame)
                 - Превью сохраняется из исходного кадра (bf)
+                - Оптимизация: ресайз только перед detect_batch (не для каждого кадра)
                 """
                 if not bf:
                     return
+                # Оптимизация: ресайзить батч ТОЛЬКО перед YOLO (не для каждого кадра отдельно)
+                resized_frames = [_resize_frame(f, MAX_FRAME_SIDE) for f in bf]
                 try:
-                    detections = self.yolo.detect_batch(bf)
+                    detections = self.yolo.detect_batch(resized_frames)
                 except Exception as exc:
                     logger.error(f"Ошибка detect_batch: {exc}")
                     return
@@ -901,7 +917,9 @@ class AnalysisBackend:
                         continue
 
                     t_sec   = fid / fps
-                    kp_list = _kp_to_list(det.get("kp") or det.get("keypoints"))
+                    # keypoints уже в формате numpy array (17, 3)
+                    keypoints = det.get("keypoints")
+                    kp_list = keypoints.tolist() if isinstance(keypoints, np.ndarray) else keypoints
 
                     frames_data.append({
                         "t":         t_sec,
@@ -910,32 +928,21 @@ class AnalysisBackend:
                         "dir":       det.get("direction", "forward"),
                         "scale":     det.get("scale",     1.0),
                         "anchor_y":  det.get("anchor_y",  0.5),
-                        "kp":        kp_list,
+                        "keypoints": keypoints,  # numpy array (17, 3) — без конвертации
                         "poses":     [det],
                     })
 
-                    # Исправлено: превью из уже уменьшенного frame
-                    _save_preview(
-                        frame      = frame,
-                        cache_dir  = self.preview_cache_dir,
-                        video_hash = video_hash,
-                        frame_id   = fid,
-                    )
-
             # ── Основной цикл ─────────────────────────────────────────────
             while cap.isOpened() and not self._stop_event.is_set():
-                grabbed = cap.grab()
-                if not grabbed:
+                ret, frame = cap.read()
+                if not ret:
                     break
 
                 if frame_idx % skip == 0:
-                    ok, frame = cap.retrieve()
-                    if ok and frame is not None:
-                        # Исправлено: убрана бесполезная копия
-                        small_frame = _resize_frame(frame, MAX_FRAME_SIDE)
-                        batch_frames.append(small_frame)
-                        batch_frame_ids.append(frame_idx)
-                        processed_count += 1
+                    # Оптимизация: сохраняем ОРИГИНАЛЬНЫЕ кадры, ресайз будет в _flush_batch()
+                    batch_frames.append(frame)
+                    batch_frame_ids.append(frame_idx)
+                    processed_count += 1
 
                 if len(batch_frames) >= dyn_batch:
                     _flush_batch(batch_frames, batch_frame_ids)
@@ -943,39 +950,29 @@ class AnalysisBackend:
                     batch_frame_ids = []
 
                 frame_idx += 1
-
-                # ── Обновление прогресса и ETA ────────────────────────────
-                if frame_idx % 30 == 0 and total_frames > 0:
-                    t_now  = time.monotonic()
-                    dt     = t_now - t_prev
-                    t_prev = t_now
-                    
-                    # Исправлено: корректный расчёт ETA
-                    # fps_window = обработанные кадры / секунду
-                    if dt > 0:
-                        fps_window.append(30.0 / dt)
-
+                t_now_ui = time.perf_counter()
+                if t_now_ui - _last_ui_update >= _ui_update_interval:
                     local_pct = frame_idx / total_frames
-                    pct = (base_progress_start
-                           + local_pct * (base_progress_end - base_progress_start))
+                    pct = base_progress_start + local_pct * (base_progress_end - base_progress_start)
 
-                    eta: float | None = None
+                    eta = None
                     if fps_window and len(fps_window) >= 3:
-                        avg_grab_fps = float(np.mean(list(fps_window)))
-                        frames_left  = total_frames - frame_idx
-                        eta = frames_left / max(avg_grab_fps, 1.0)
+                        avg_fps = float(np.mean(list(fps_window)))
+                        frames_left = total_frames - frame_idx
+                        eta = frames_left / max(avg_fps, 1.0)
 
                     self._emit_progress(AnalysisProgress(
-                        percent       = round(pct, 1),
-                        status        = f"Извлечение: {os.path.basename(path)}",
-                        status_code   = AnalysisStatus.EXTRACTING_POSES,
-                        video_idx     = video_idx,
-                        video_count   = n_videos,
-                        current_frame = frame_idx,
-                        total_frames  = total_frames,
-                        current_video = path,
-                        eta_seconds   = round(eta, 1) if eta is not None else None,
+                        percent=round(pct, 1),
+                        status=f"Извлечение: {os.path.basename(path)}",
+                        status_code=AnalysisStatus.EXTRACTING_POSES,
+                        video_idx=video_idx,
+                        video_count=n_videos,
+                        current_frame=frame_idx,
+                        total_frames=total_frames,
+                        current_video=path,
+                        eta_seconds=round(eta, 1) if eta is not None else None,
                     ))
+                    _last_ui_update = t_now_ui
 
             # Финальный flush
             if batch_frames and not self._stop_event.is_set():

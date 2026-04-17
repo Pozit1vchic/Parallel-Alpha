@@ -174,16 +174,21 @@ class ResultsPanel(tk.Frame):
         # 2. Строим кнопки категорий
         self._rebuild_categories(categories)
 
-        # 3. Показываем контейнер списка с fill+expand
+        # 3. Проверка и пересоздание списка если контейнер был уничтожен
+        if not hasattr(self, '_list_outer') or not self._list_outer.winfo_exists():
+            self._list_outer = tk.Frame(self, bg=self.colors["card"])
+            self.vlist = VirtualResultsList(
+                self._list_outer,
+                self.colors,
+                on_select=self.callbacks.get(
+                    "on_select", lambda _: None),
+                lang=self._lang)
+
+        # Показываем контейнер списка с fill+expand
         self._list_outer.pack(fill=tk.BOTH, expand=True)
 
-        # 4. Передаём данные в виртуальный список
+        # Передаём данные в виртуальный список
         self.vlist.set_matches(matches)
-        
-        # 5. Принудительно обновляем scrollregion и рендер после set_matches
-        # Это гарантирует корректный расчет высоты контента перед первой отрисовкой
-        self.vlist._update_scrollregion()
-        self.vlist._render()
 
     def hide_results(self) -> None:
         """Скрыть список и показать заглушку."""

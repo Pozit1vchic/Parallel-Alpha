@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 core/matcher/pose_processor.py
-v14 — максимальная производительность + точность.
+v15 — исправления точности + валидация.
 
-Улучшения vs v13:
+Улучшения vs v14:
   1. mirror_vectors: Python-цикл → предвычисленные индексные массивы,
      одна операция gather/scatter на весь батч
   2. preprocess_pose: np.dot вместо np.linalg.norm (быстрее ~1.5×),
@@ -16,8 +16,12 @@ v14 — максимальная производительность + точн
   5. compute_pose_features: np.einsum вместо mean+subtract (быстрее)
   6. Новая функция: batch_preprocess_poses — обрабатывает список поз
      полностью векторизованно (нет Python-цикла по позам)
-  7. Совместимость с MotionMatcher v14 (mirror_vectors API не изменён)
+  7. Совместимость с MotionMatcher v15 (mirror_vectors API не изменён)
+  8. MIN_VISIBLE_KPS снижено с 8 до 6
+  9. Добавлены геометрические проверки bbox (area, aspect ratio)
+ 10. mirror_vectors теперь инвертирует direction метку
 """
+
 from __future__ import annotations
 
 from typing import TypeAlias, Optional
@@ -142,7 +146,7 @@ MIN_ANCHOR_CONFIDENCE = 0.31
 ANCHOR_CONF_KPS       = [5, 6, 11, 12, 13, 14]
 ANCHOR_CONF_KPS_ARR   = np.array(ANCHOR_CONF_KPS, dtype=np.intp)
 
-_MIN_VISIBLE_KPS      = 8
+_MIN_VISIBLE_KPS      = 6   # снижено с 8 до 6
 _MIN_VISIBLE_ANCHORS  = 2
 
 
@@ -159,6 +163,10 @@ def is_pose_valid(pose_data: PoseDict) -> bool:
     - Early exit в порядке возрастания стоимости проверки
     - Нет промежуточных аллокаций (булева маска пересчитывается inline)
     - np.count_nonzero быстрее .sum() для bool-массивов
+
+    v15: Добавлены геометрические проверки bbox:
+    - area >= 500 и area <= 500000
+    - aspect ratio >= 0.2 и <= 5.0
     """
     kps = pose_data.get("keypoints")
     if kps is None:
@@ -187,6 +195,16 @@ def is_pose_valid(pose_data: PoseDict) -> bool:
     ))
     if n_anchor < _MIN_VISIBLE_ANCHORS:
         return False
+
+    # 4. Геометрические проверки bbox (новое в v15)
+    bbox = pose_data.get("bbox", [0, 0, 0, 0])
+    if bbox is not None:
+        area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+        if area < 500 or area > 500000:
+            return False
+        aspect = (bbox[2] - bbox[0]) / max(bbox[3] - bbox[1], 1)
+        if aspect < 0.2 or aspect > 5.0:
+            return False
 
     return True
 
@@ -335,6 +353,20 @@ def compute_pose_features(kps_xy: np.ndarray) -> tuple[float, float]:
     (scale, anchor_y) для re-scoring.
 
     Оптимизация: np.einsum вместо mean+broadcast.
+
+    Parameters
+    ----------
+    kps_xy : np.ndarray (17, 2) — keypoints координаты
+
+    Returns
+    -------
+    tuple[float, float]
+        scale : float — максимальное отклонение от центроида (размер позы)
+        anchor_y : float — Y-координата центроида опорных точек
+
+    Метрики используются в motion_matcher.py для штрафов:
+    - scale: чем ближе scale1 и scale2, тем выше score
+    - anchor_y: чем ближе anchor_y1 и anchor_y2, тем выше score
     """
     # Центроид опорных точек
     anc   = kps_xy[ANCHOR_KPS_ARR]         # (4, 2)
@@ -415,6 +447,41 @@ def mirror_vectors(vec: torch.Tensor, conf: Optional[torch.Tensor] = None) -> to
     return mirrored
 
 
+def mirror_pose_with_meta(pose: np.ndarray, meta: dict) -> tuple[np.ndarray, dict]:
+    """
+    Зеркальное отражение позы с коррекцией direction метки.
+
+    v15: При зеркалировании инвертируется направление:
+    - left  → right
+    - right → left
+    - forward → forward
+    - back → back
+    - unknown → unknown
+
+    Parameters
+    ----------
+    pose : np.ndarray (34,) — нормализованный вектор позы
+    meta : dict — метаданные позы (должен содержать 'dir' ключ)
+
+    Returns
+    -------
+    tuple[np.ndarray, dict]
+        mirrored_pose : np.ndarray (34,)
+        mirrored_meta : dict — с изменённой 'dir' меткой
+    """
+    mirrored_vec = mirror_vectors(torch.from_numpy(pose)).numpy()
+    dir_map = {
+        "left": "right",
+        "right": "left",
+        "forward": "forward",
+        "back": "back",
+        "unknown": "unknown"
+    }
+    current_dir = meta.get("dir", "unknown")
+    meta["dir"] = dir_map.get(current_dir, current_dir)
+    return mirrored_vec, meta
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # § 6. СБОРКА ТЕНЗОРА
 # ──────────────────────────────────────────────────────────────────────────────
@@ -433,6 +500,9 @@ def build_poses_tensor(
     2. best_conf = mean только по ВИДИМЫМ точкам (не всем 17)
     3. Предварительный сбор kps в numpy-массив → batch вызов
     4. scale/anchor_y векторизованы через batch_compute_features
+
+    v15: mirror_pose_with_meta — инвертирует direction при зеркалировании.
+    v16: обратная совместимость с "kp" (list) и "keypoints" (np.ndarray).
     """
     # ── Фаза 1: выбор лучшей позы (Python-цикл, но лёгкий) ──────────────
     selected_kps:   list[np.ndarray] = []   # (17, 3) каждый
@@ -443,7 +513,9 @@ def build_poses_tensor(
         f         = int(  frame.get("f",         0))
         video_idx = int(  frame.get("video_idx", 0))
         direction =       frame.get("dir",       "forward")
-        frame_kp  =       frame.get("kp")
+        
+        # ── ОБРАТНАЯ СОВМЕСТИМОСТЬ: "kp" (list) или "keypoints" (np.ndarray) ──
+        frame_kp = frame.get("kp") or frame.get("keypoints")
 
         poses = frame.get("poses")
         if not poses:
@@ -457,8 +529,17 @@ def build_poses_tensor(
             if not is_pose_valid(pose):
                 continue
 
+            # ── ОБРАТНАЯ СОВМЕСТИМОСТЬ в pose ─────────────────────────────
             kps = pose.get("keypoints")
             if kps is None:
+                kps = pose.get("kp")
+            if kps is None:
+                continue
+
+            # Приводим к numpy array для единообразия
+            if isinstance(kps, list):
+                kps = np.array(kps, dtype=np.float32)
+            elif not isinstance(kps, np.ndarray):
                 continue
 
             # Conf только по ВИДИМЫМ точкам (не всем 17)
@@ -481,6 +562,9 @@ def build_poses_tensor(
                         best_kp_meta = kp_raw.tolist()
                     elif isinstance(kp_raw, list):
                         best_kp_meta = kp_raw
+                    else:
+                        # Fallback: конвертируем kps в list
+                        best_kp_meta = kps[:COCO_N_KPS].tolist()
 
         if best_kps is None:
             continue

@@ -68,18 +68,11 @@ class VirtualResultsList(SmoothScrollMixin):
         self._filter_cat: str   = ""
         self._min_sim:    float = 0.0
 
-        # ── Защита от рекурсии в _on_configure ─────────────────────────────
-        # Используем after_idle вместо рекурсивного флага
         self._pending_scroll_update: bool = False
 
-        # ── Кэш для плавного скролла — хэш данных строки ──────────────────
-        self._last_rendered: dict[int, tuple] = {}  # fi -> (hash_data, hash_state)
-
-        # ── Контейнер — пакуется в parent, fill+expand ───────────────────
         self._outer = tk.Frame(parent, bg=colors["bg"])
         self._outer.pack(fill=tk.BOTH, expand=True)
 
-        # ── Canvas + Scrollbar — grid для надёжного layout ───────────────
         self._outer.grid_rowconfigure(0, weight=1)
         self._outer.grid_columnconfigure(0, weight=1)
         self._outer.grid_columnconfigure(1, weight=0)
@@ -98,14 +91,12 @@ class VirtualResultsList(SmoothScrollMixin):
 
         self._canvas.configure(yscrollcommand=self._sb.set)
 
-        # ── Привязки ───────────────────────────────────────────────────
         self._canvas.bind("<Configure>",       self._on_configure)
         self._canvas.bind("<Button-1>",        self._on_click)
         self._canvas.bind("<Double-Button-1>", self._on_dbl_click)
         self._canvas.bind("<Button-3>",        self._on_right_click)
         self._bind_smooth_scroll(self._canvas, self._scroll_units)
 
-        # ── Контекстное меню ───────────────────────────────────────────
         self._ctx = tk.Menu(
             self._canvas, tearoff=0,
             bg=colors["card"], fg=colors["text"])
@@ -119,11 +110,9 @@ class VirtualResultsList(SmoothScrollMixin):
         self._hidden_set.clear()
         self._selected_fi = -1
         self._apply_filter()
+        if hasattr(self, '_canvas') and self._canvas and self._canvas.winfo_exists():
+            self._canvas.yview_moveto(0)
         self._refresh()
-        # Принудительный update для корректного расчета scrollregion
-        self._canvas.update()
-        # Сброс прокрутки в начало
-        self._canvas.yview_moveto(0)
 
     def select_by_match_idx(self, mi: int) -> None:
         for fi, idx in enumerate(self._filtered):
@@ -160,7 +149,6 @@ class VirtualResultsList(SmoothScrollMixin):
     # ── Внутреннее ────────────────────────────────────────────────────────
 
     def _refresh(self) -> None:
-        """Обновить scrollregion и перерисовать. Единая точка входа."""
         self._update_scrollregion()
         self._render()
 
@@ -192,7 +180,6 @@ class VirtualResultsList(SmoothScrollMixin):
             reverse=self._sort_desc)
 
         self._filtered = result
-        # Корректируем выделение чтобы не выйти за границы
         if self._filtered:
             self._selected_fi = max(
                 0, min(self._selected_fi, len(self._filtered) - 1))
@@ -200,24 +187,16 @@ class VirtualResultsList(SmoothScrollMixin):
             self._selected_fi = -1
 
     def _on_configure(self, _e: tk.Event) -> None:
-        # Защита от рекурсии: используем after_idle
         if self._pending_scroll_update:
             return
         self._pending_scroll_update = True
-        # Планируем обновление scrollregion после отрисовки
         self._canvas.after_idle(self._schedule_scroll_update)
 
     def _schedule_scroll_update(self) -> None:
-        """Вызывается after_idle для обновления scrollregion."""
         self._pending_scroll_update = False
         self._update_scrollregion()
-        self._render()
 
     def _update_scrollregion(self) -> None:
-        """Обновляет scrollregion Canvas. Вызывает update_idletasks для точности."""
-        # Принудительная синхронизация перед расчетом
-        self._canvas.update_idletasks()
-        
         w  = max(self._canvas.winfo_width(), 1)
         ch = max(self._canvas.winfo_height(), 1)
 
@@ -228,11 +207,9 @@ class VirtualResultsList(SmoothScrollMixin):
             return
 
         total_h = len(self._filtered) * self.ROW_H
-        # scrollregion всегда равен реальной высоте контента
         self._canvas.configure(
             scrollregion=(0, 0, w, max(total_h, ch)))
 
-        # Показ/скрытие скроллбара через grid
         if total_h > ch:
             self._sb.grid()
         else:
@@ -274,24 +251,7 @@ class VirtualResultsList(SmoothScrollMixin):
             self._canvas.yview_moveto(
                 (item_bot - ch) / max(total_h, 1))
 
-    def _hash_row(self, m: dict, selected: bool) -> int:
-        """
-        Вычислить хэш данных строки.
-        Используется для кэширования — если хэш не изменился, строку не перерисовывать.
-        """
-        # Включаем в хэш: sim, direction, t1, t2 и флаг selected
-        data = (
-            m.get("sim", 0.0),
-            m.get("direction", "forward"),
-            m.get("t1", 0.0),
-            m.get("t2", 0.0),
-            m.get("category", ""),
-            selected,
-        )
-        return hash(data)
-
     def _render(self) -> None:
-        """Рисует только видимые строки (виртуализация) с кэшированием."""
         c = self.colors
 
         cw = max(self._canvas.winfo_width(), 1)
@@ -310,13 +270,12 @@ class VirtualResultsList(SmoothScrollMixin):
         view_top = self._canvas.yview()[0]
         y_offset = view_top * total_h
 
-        # Вычисляем только видимый диапазон строк
-        start_fi = max(0, int(y_offset // self.ROW_H) - 1)
+        # ИСПРАВЛЕНО: убрано "- 1" чтобы y не был отрицательным
+        start_fi = max(0, int(y_offset // self.ROW_H))
         end_fi   = min(
             len(self._filtered),
-            start_fi + int(ch // self.ROW_H) + 3)
+            start_fi + int(ch // self.ROW_H) + 2)
 
-        # Очищаем только видимые области
         self._canvas.delete("all")
 
         for fi in range(start_fi, end_fi):
@@ -325,19 +284,10 @@ class VirtualResultsList(SmoothScrollMixin):
             y   = fi * self.ROW_H - y_offset
             sel = fi == self._selected_fi
 
-            # ── Кэширование состояния выделения ────────────────────────────
-            # Хэш данных строки для кэширования
-            row_hash = self._hash_row(m, sel)
-            cached_hash, _ = self._last_rendered.get(fi, (None, None))
-            
-            # Если данные не изменились, пропускаем перерисовку
-            if row_hash == cached_hash:
+            # ИСПРАВЛЕНО: пропускаем строки за пределами видимой области
+            if y + self.ROW_H < 0 or y > ch:
                 continue
-            
-            # Сохраняем хэш
-            self._last_rendered[fi] = (row_hash, sel)
 
-            # ── Фон строки ────────────────────────────────────────────
             if sel:
                 bg = c.get("active_row", "#1e3a5f")
             elif fi % 2 == 0:
@@ -352,7 +302,6 @@ class VirtualResultsList(SmoothScrollMixin):
             sim     = float(m.get("sim", 0.0))
             sim_pct = min(sim * 100, 100.0)
 
-            # ── Цветная полоска слева (3px) ───────────────────────────
             bar_col = (
                 c.get("success", "#22c55e") if sim >= 0.85
                 else c.get("accent", "#3b82f6") if sim >= 0.70
@@ -362,7 +311,6 @@ class VirtualResultsList(SmoothScrollMixin):
                 0, y + 2, 3, y + self.ROW_H - 3,
                 fill=bar_col, outline="")
 
-            # ── Мини прогресс-бар схожести ────────────────────────────
             bar_w = int((cw - 16) * sim)
             self._canvas.create_rectangle(
                 8, y + self.ROW_H - 8,
@@ -374,7 +322,6 @@ class VirtualResultsList(SmoothScrollMixin):
                     8 + bar_w, y + self.ROW_H - 5,
                     fill=bar_col, outline="")
 
-            # ── Процент схожести ──────────────────────────────────────
             self._canvas.create_text(
                 12, y + 14,
                 text=f"{sim_pct:.1f}%",
@@ -382,7 +329,6 @@ class VirtualResultsList(SmoothScrollMixin):
                 fill=bar_col,
                 font=("Inter", 12, "bold"))
 
-            # ── Направление ───────────────────────────────────────────
             direction = m.get("direction", "forward")
             arrow     = _dir_arrow(direction)
             dir_text  = _dir_label(direction, self.lang)
@@ -393,7 +339,6 @@ class VirtualResultsList(SmoothScrollMixin):
                 fill=c["text_secondary"],
                 font=("Inter", 9))
 
-            # ── Времена (правая сторона) ──────────────────────────────
             t1 = _fmt_hms(m.get("t1", 0.0))
             t2 = _fmt_hms(m.get("t2", 0.0))
             self._canvas.create_text(
@@ -409,14 +354,12 @@ class VirtualResultsList(SmoothScrollMixin):
                 fill=c["text_secondary"],
                 font=("Inter", 9))
 
-            # ── Разделитель ───────────────────────────────────────────
             self._canvas.create_line(
                 0, y + self.ROW_H - 1,
                 cw, y + self.ROW_H - 1,
                 fill=c["border"])
 
     def _fi_at_y(self, y_canvas: int) -> int:
-        """Индекс строки по Y-координате клика."""
         if not self._filtered:
             return -1
         total_h  = len(self._filtered) * self.ROW_H
@@ -457,8 +400,20 @@ class VirtualResultsList(SmoothScrollMixin):
         self._refresh()
 
     def cleanup(self) -> None:
-        """Очистка ресурсов."""
-        if hasattr(self, '_ctx'):
-            self._ctx.destroy()
-        if hasattr(self, '_outer'):
-            self._outer.destroy()
+        if hasattr(self, '_ctx') and self._ctx is not None:
+            try:
+                self._ctx.destroy()
+            except Exception:
+                pass
+            self._ctx = None
+        
+        if hasattr(self, '_canvas') and self._canvas is not None:
+            try:
+                self._canvas.delete("all")
+            except Exception:
+                pass
+        
+        self._all_matches.clear()
+        self._filtered.clear()
+        self._hidden_set.clear()
+        self._selected_fi = -1

@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
+import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
@@ -220,8 +221,11 @@ class YoloEngine:
             self._release()
 
         try:
-            self.model = YOLO(yolo_arg)
+            self.model = YOLO(yolo_arg, task='pose')
             self.model.to(self.device)
+            if self.device == 'cuda':
+                self.use_fp16 = True
+                print(f"[YoloEngine] FP16: {self.use_fp16} (принудительно)")
         except Exception as exc:
             _safe_cb(on_status, f"Ошибка загрузки: {exc}")
             self.model = None
@@ -275,6 +279,8 @@ class YoloEngine:
         return BATCH_SIZE_GPU if self.device != "cpu" else BATCH_SIZE_CPU
 
     def detect_batch(self, frames_batch: list) -> list[dict | None]:
+        import time
+        t_yolo_start = time.perf_counter()
         """
         Детектировать позы в батче кадров.
         """
@@ -285,19 +291,23 @@ class YoloEngine:
             raise RuntimeError("Модель не загружена. Вызовите load().")
 
         try:
-            # Прямой stream=True без промежуточных списков
+            # Batch inference без stream — весь батч за один вызов
             results = self.model.predict(
                 frames_batch,
                 imgsz=_IMGSZ,
                 verbose=False,
                 half=self.use_fp16,
                 conf=_CONF,
-                stream=True,  # Генератор YOLO
+                stream=False,  # Batch inference
                 device=self.device,
             )
 
             # Векторизованный парсинг
             batch_poses = self._parse_batch_results(results)
+            t_yolo_end = time.perf_counter()
+            dt = t_yolo_end - t_yolo_start
+            if dt > 1.0:
+                print(f"[YOLO] Батч {len(frames_batch)} кадров: {dt:.2f}s")
 
             return batch_poses
 
@@ -315,13 +325,34 @@ class YoloEngine:
     def _parse_batch_results(self, results) -> list[dict | None]:
         """
         Разобрать результаты YOLO → список dict или None.
-        Векторизованная обработка через numpy.
+        Векторизованная обработка через numpy — один batch GPU→CPU.
         """
-        batch_poses = []
+        if not results:
+            return []
+        
+        # Собрать все keypoints в один numpy массив за один раз
+        # res.keypoints.data — это torch.Tensor (N, 17, 3) или []
+        all_kp = []
+        all_orig_shapes = []
+        all_conf = []
+        
         for res in results:
-            pose_data = self._parse_result(res)
-            batch_poses.append(pose_data)
-        return batch_poses
+            if res.keypoints is None or len(res.keypoints.data) == 0:
+                all_kp.append(None)
+                all_orig_shapes.append((0, 0))
+                all_conf.append(0.0)
+            else:
+                # Один вызов .cpu().numpy() на весь батч
+                kp = res.keypoints.data[0].cpu().numpy()
+                all_kp.append(kp)
+                all_orig_shapes.append(res.orig_shape)
+                all_conf.append(float(np.mean(kp[:, 2])))
+        
+        # Сформировать результаты
+        return [
+            self._parse_single_result(kp, orig_h, orig_w, conf)
+            for kp, (orig_h, orig_w), conf in zip(all_kp, all_orig_shapes, all_conf)
+        ]
 
     def _detect_single(self, frame) -> dict | None:
         """Обработка одного кадра (fallback при OOM)."""
@@ -338,22 +369,28 @@ class YoloEngine:
                 device=self.device,
             )
             if results:
-                return self._parse_result(results[0])
+                return self._parse_single_result(results[0])
         except Exception:
             pass
         return None
 
-    def _parse_result(self, res) -> dict | None:
+    def _parse_single_result(self, kp: np.ndarray, orig_h: int, orig_w: int, conf: float) -> dict | None:
         """
         Разобрать один результат YOLO → структурированный dict или None.
+        Векторизованная версия для batch обработки.
+        
+        Parameters
+        ----------
+        kp : np.ndarray
+            Keypoints array (N, 3)
+        orig_h : int
+            Original height
+        orig_w : int
+            Original width
+        conf : float
+            Confidence score
         """
-        if res.keypoints is None or len(res.keypoints.data) == 0:
-            return None
-
-        # Берём самый уверенный детект (первый — YOLO уже сортирует по conf)
-        kp = res.keypoints.data[0].cpu().numpy()  # (N, 3)
-
-        if kp.shape[0] < 17:
+        if kp is None or kp.shape[0] < 17:
             return None
 
         kp17 = kp[:17]  # гарантированно 17 точек COCO
@@ -362,8 +399,6 @@ class YoloEngine:
         visible = kp17[kp17[:, 2] >= self.KP_VIS_THRESHOLD]
         if len(visible) < 5:
             return None
-
-        orig_h, orig_w = res.orig_shape
 
         # bbox по видимым точкам
         if len(visible) > 0:
@@ -378,9 +413,8 @@ class YoloEngine:
         direction = self._classify_direction(kp17)
 
         return {
-            "keypoints": kp17,
-            "kp": kp17.tolist(),
-            "confidence": float(np.mean(kp17[:, 2])),
+            "keypoints": kp17,  # numpy array (17, 3)
+            "confidence": conf,
             "bbox": bbox,
             "direction": direction,
             "orig_w": int(orig_w),
@@ -533,11 +567,7 @@ class YoloEngine:
                 pass
         
         elapsed = time.time() - start_time
-        
-        # Очистка памяти после прогрева
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            
+        # OOM очистка только при реальной ошибке, не при каждом прогреве
         return elapsed
 
     # ─────────────────────────────────────────────────────────────

@@ -778,8 +778,8 @@ class ParallelFinderApp:
         if _HAS_BACKEND:
             try:
                 device       = "cuda" if torch.cuda.is_available() else None
-                self.backend = AnalysisBackend(
-                    device=device, yolo=self.yolo)
+                self.backend = AnalysisBackend()
+                self.backend.yolo = self.yolo
             except Exception as e:
                 print(f"[Backend] {e}")
 
