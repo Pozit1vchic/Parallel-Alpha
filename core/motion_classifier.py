@@ -1,131 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""core/motion_classifier.py — Классификация движений по скелету позы."""
+"""
+core/motion_classifier.py — Классификация движений для EDL (Edit Decision List).
+Новые категории: static, cut_point, action_peak, direction_LR, direction_RL, direction_FB.
+"""
 from __future__ import annotations
 
-import math
 import numpy as np
-from typing import Optional
-
-# ── Словарь категорий движений (ru/en) ───────────────────────────────────────
-
-MOVEMENT_CATEGORIES: dict[str, dict[str, list[str]]] = {
-    "locomotion": {
-        "ru": ["ходьба", "бег", "прыжки", "ползание", "лазание",
-               "шаг вперёд", "движение"],
-        "en": ["walking", "running", "jumping", "crawling", "climbing",
-               "stepping", "moving"],
-    },
-    "arms": {
-        "ru": ["поднятие руки", "махи руками", "хлопки",
-               "указание", "приветствие", "руки вверх"],
-        "en": ["raising arm", "arm swing", "clapping",
-               "pointing", "waving", "arms up"],
-    },
-    "legs": {
-        "ru": ["приседание", "выпады", "махи ногами",
-               "подъём на носки", "стойка на одной ноге"],
-        "en": ["squat", "lunge", "leg swing",
-               "toe raise", "one-leg stand"],
-    },
-    "torso": {
-        "ru": ["наклон", "поворот корпуса", "скручивание",
-               "прогиб", "наклон в сторону"],
-        "en": ["bend", "torso rotation", "twist",
-               "backbend", "side lean"],
-    },
-    "sports_fighting": {
-        "ru": ["удар рукой", "удар ногой", "блок",
-               "бросок", "захват"],
-        "en": ["punch", "kick", "block",
-               "throw", "grapple"],
-    },
-    "sports_ball": {
-        "ru": ["бросок мяча", "удар по мячу", "подача", "свинг"],
-        "en": ["ball throw", "ball kick", "serve", "swing"],
-    },
-    "sports_gymnastics": {
-        "ru": ["кувырок", "стойка", "колесо", "сальто", "шпагат"],
-        "en": ["roll", "handstand", "cartwheel", "flip", "split"],
-    },
-    "dance": {
-        "ru": ["кружение", "волна", "танцевальный шаг", "вращение"],
-        "en": ["spin", "body wave", "dance step", "rotation"],
-    },
-    "daily": {
-        "ru": ["сидение", "вставание", "подъём предмета", "открывание"],
-        "en": ["sitting", "standing up", "picking up", "opening"],
-    },
-    "work": {
-        "ru": ["поднятие тяжести", "толкание", "тяга", "копание"],
-        "en": ["lifting", "pushing", "pulling", "digging"],
-    },
-    "gestures": {
-        "ru": ["рукопожатие", "объятие", "поклон", "жест рукой"],
-        "en": ["handshake", "hug", "bow", "hand gesture"],
-    },
-    "emotional": {
-        "ru": ["прыжок радости", "топанье", "отшатывание", "дрожь"],
-        "en": ["joy jump", "stomping", "recoil", "trembling"],
-    },
-    "exercise": {
-        "ru": ["отжимания", "приседания", "планка", "выпады", "пресс"],
-        "en": ["push-up", "squat", "plank", "lunge", "crunch"],
-    },
-    "medical": {
-        "ru": ["подъём ноги", "велосипед", "разведение рук"],
-        "en": ["leg raise", "bicycle", "arm spread"],
-    },
-    "falls": {
-        "ru": ["падение", "спотыкание", "восстановление равновесия"],
-        "en": ["fall", "stumble", "balance recovery"],
-    },
-    # Направления (camera-facing — оставляем как было)
-    "facing_camera": {
-        "ru": ["лицом к камере"],
-        "en": ["facing camera"],
-    },
-    "facing_right": {
-        "ru": ["смотрит вправо"],
-        "en": ["facing right"],
-    },
-    "facing_left": {
-        "ru": ["смотрит влево"],
-        "en": ["facing left"],
-    },
-    "facing_away": {
-        "ru": ["спиной к камере"],
-        "en": ["facing away"],
-    },
-    "other": {
-        "ru": ["прочее"],
-        "en": ["other"],
-    },
-}
-
-# Человекочитаемые названия категорий
-CATEGORY_LABELS: dict[str, dict[str, str]] = {
-    "locomotion":         {"ru": "Передвижение",    "en": "Locomotion"},
-    "arms":               {"ru": "Движения рук",    "en": "Arms"},
-    "legs":               {"ru": "Движения ног",    "en": "Legs"},
-    "torso":              {"ru": "Корпус",           "en": "Torso"},
-    "sports_fighting":    {"ru": "Единоборства",    "en": "Fighting"},
-    "sports_ball":        {"ru": "Спорт с мячом",   "en": "Ball sports"},
-    "sports_gymnastics":  {"ru": "Гимнастика",      "en": "Gymnastics"},
-    "dance":              {"ru": "Танец",            "en": "Dance"},
-    "daily":              {"ru": "Быт",              "en": "Daily"},
-    "work":               {"ru": "Работа",           "en": "Work"},
-    "gestures":           {"ru": "Жесты",            "en": "Gestures"},
-    "emotional":          {"ru": "Эмоции",           "en": "Emotional"},
-    "exercise":           {"ru": "Упражнения",       "en": "Exercise"},
-    "medical":            {"ru": "Медицина",         "en": "Medical"},
-    "falls":              {"ru": "Падения",          "en": "Falls"},
-    "facing_camera":      {"ru": "Лицом к камере",  "en": "Facing camera"},
-    "facing_right":       {"ru": "Смотрит вправо",  "en": "Facing right"},
-    "facing_left":        {"ru": "Смотрит влево",   "en": "Facing left"},
-    "facing_away":        {"ru": "Спиной к камере", "en": "Facing away"},
-    "other":              {"ru": "Прочее",           "en": "Other"},
-}
+import torch
+from typing import Optional, Tuple
 
 # COCO-17 индексы ключевых точек
 _KP = {
@@ -139,177 +22,542 @@ _KP = {
     "l_ankle": 15, "r_ankle": 16,
 }
 
+# ── Константы для EDL категорий ───────────────────────────────────────────────
+_STATIC_MOTION_THRESHOLD = 0.05   # Максимальная амплитуда движения для static
+_CUT_SCORE_MIN = 0.6              # Минимальный cut_score для cut_point
+_CUT_SCORE_MAX = 0.95             # Максимальный cut_score (идеальная поза)
+_ACTION_PEAK_MOTION = 0.30        # Минимальная скорость для action_peak
 
-def get_category_label(category_key: str, lang: str = "ru") -> str:
-    """Возвращает человекочитаемое название категории."""
-    return CATEGORY_LABELS.get(category_key, {}).get(lang, category_key)
+
+def _distance(p1: np.ndarray, p2: np.ndarray) -> float:
+    """Евклидово расстояние между двумя точками (x, y)."""
+    return float(np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2))
 
 
-def get_movement_label(category_key: str, lang: str = "ru",
-                       index: int = 0) -> str:
-    """Возвращает название конкретного движения из категории."""
-    labels = MOVEMENT_CATEGORIES.get(category_key, {}).get(lang, [])
-    if labels:
-        return labels[min(index, len(labels) - 1)]
-    return category_key
+def _normalize_keypoints(kp: np.ndarray, orig_w: int, orig_h: int) -> np.ndarray:
+    """Нормализовать координаты ключевых точек в диапазон [0, 1]."""
+    if orig_w <= 0:
+        orig_w = 1
+    if orig_h <= 0:
+        orig_h = 1
+    kp_norm = kp.copy()
+    kp_norm[:, 0] = kp[:, 0] / orig_w
+    kp_norm[:, 1] = kp[:, 1] / orig_h
+    return kp_norm
+
+
+def _compute_centroid(kp: np.ndarray) -> np.ndarray:
+    """Вычислить центр кадра в нормализованных координатах."""
+    return np.array([0.5, 0.5])
 
 
 class MotionClassifier:
     """
-    Классифицирует движение по скелетным данным COCO-17.
-
-    Использует эвристики на основе:
-    - положения суставов относительно центра тела
-    - углов между суставами
-    - направления взгляда / ориентации тела
-    - симметрии/асимметрии позы
+    Классификатор движений для EDL (Edit Decision List).
+    
+    Новые категории:
+    - static        — нет движения (motion_magnitude < 0.05)
+    - cut_point     — идеальная поза для склейки (симметрия, центр кадра, стабильность)
+    - action_peak   — пик действия (максимальная скорость движения)
+    - direction_LR  — движение слева направо
+    - direction_RL  — движение справа налево
+    - direction_FB  — движение к камере / от камеры
+    
+    Старые категории удалены: dance, sports_*, exercise, medical, daily,
+    emotional, falls, work, gestures.
     """
 
-    def __init__(self, conf_threshold: float = 0.3) -> None:
+    def __init__(self, conf_threshold: float = 0.30) -> None:
         self._conf = conf_threshold
+        self._orig_w = 0
+        self._orig_h = 0
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Public API
+    # ──────────────────────────────────────────────────────────────────────
 
     def classify(self, keypoints: np.ndarray,
-                 lang: str = "ru") -> dict:
+                 lang: str = "ru",
+                 orig_w: Optional[int] = None,
+                 orig_h: Optional[int] = None) -> dict:
         """
-        Классифицирует позу.
-
+        Классифицирует позу по новым EDL категориям.
+        
         Parameters
         ----------
         keypoints : np.ndarray
             Shape (17, 3) — [x, y, conf] для каждой точки COCO-17.
         lang : str
-            Язык меток.
-
+            Язык меток (ru/en).
+        orig_w, orig_h : Optional[int]
+            Размеры исходного кадра (для нормализации координат).
+        
         Returns
         -------
         dict с ключами:
-            category     : str  — ключ категории
-            label        : str  — человекочитаемое название категории
-            movement     : str  — конкретное движение
+            primary_cat  : str   — ключ основной категории
+            cut_score    : float 0..1 — насколько хороша поза для склейки
+            motion_vec   : Tuple[float, float, float] — вектор движения
             direction    : str  — направление (forward/left/right/back)
             confidence   : float
         """
+        if orig_w is not None:
+            self._orig_w = orig_w
+        if orig_h is not None:
+            self._orig_h = orig_h
+
         if keypoints is None or len(keypoints) < 1:
             return self._unknown(lang)
 
         kp = np.array(keypoints, dtype=float)
-
-        # Защита от плоского вектора (51,) → (17, 3)
-        if kp.ndim == 1:
-            n = len(kp)
-            if n == 51:
-                kp = kp.reshape(17, 3)
-            elif n == 34:
-                kp = np.hstack([
-                    kp.reshape(17, 2),
-                    np.ones((17, 1))
-                ])
-            else:
-                return self._unknown(lang)
-
-        elif kp.ndim == 2:
-            if kp.shape[1] == 2:
-                kp = np.hstack([
-                    kp,
-                    np.ones((kp.shape[0], 1))
-                ])
-            elif kp.shape[1] != 3:
-                return self._unknown(lang)
-
-        else:
-            return self._unknown(lang)
-
         if kp.shape[0] < 17:
             return self._unknown(lang)
 
         kp = kp[:17]
 
-        # Направление (оставляем как primary)
+        # Определяем направление
         direction = self._get_direction(kp)
+        direction_conf = self._get_direction_confidence(kp)
 
-        # Основная категория по позе
-        category, movement_idx, conf = self._classify_pose(kp)
+        # Вычисляем motion magnitude
+        # Если это одна поза — motion magnitude = 0 (static), иначе нужно сравнить с предыдущей
+        # Для EDL-классификации одной позы считаем "движение" по смещению центра
+        motion_magnitude = self._compute_motion_magnitude(kp)
 
-        label    = get_category_label(category, lang)
-        movement = get_movement_label(category, lang, movement_idx)
+        # Вычисляем cut_score
+        cut_score = self.get_cut_score(kp)
+
+        # Вычисляем motion vector (для последовательности)
+        motion_vec = self.get_motion_vector(kp, kp)
+
+        # Определяем primary category
+        primary_cat = self._determine_primary_category(
+            motion_magnitude, direction, cut_score
+        )
 
         return {
-            "category":   category,
-            "label":      label,
-            "movement":   movement,
-            "direction":  direction,
-            "confidence": conf,
+            "primary_cat":  primary_cat,
+            "cut_score":    float(cut_score),
+            "motion_vec":   motion_vec,
+            "direction":    direction,
+            "confidence":   float(direction_conf),
         }
+
     def classify_match(self, match: dict, lang: str = "ru") -> str:
         """
-        Быстрая классификация для матча (совместимость с main_window).
-        Возвращает строку для отображения.
+        Быстрая классификация для матча.
+        Возвращает строку для отображения в UI.
         """
-        # Пытаемся взять keypoints из матча
         kp1 = match.get("kp1")
         kp2 = match.get("kp2")
-        kp  = kp1 if kp1 is not None else kp2
+        kp = kp1 if kp1 is not None else kp2
 
         direction = match.get("direction", "unknown")
 
         if kp is not None:
             result = self.classify(kp, lang)
-            # Комбинируем: движение + направление
+            primary = result.get("primary_cat", "unknown")
+            
+            # Комбинируем категорию с направлением
+            cat_label = self._get_category_label(primary, lang)
             dir_label = self._direction_label(direction, lang)
-            if result["category"] not in (
-                    "facing_camera", "facing_right",
-                    "facing_left", "facing_away", "other"):
-                return f"{result['movement']} · {dir_label}"
-            return result["movement"]
+            
+            return f"{cat_label} · {dir_label}"
 
-        # Фолбек — только направление
         return self._direction_label(direction, lang)
 
-    # ── Направление ───────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────────
+    # get_cut_score() — Метод оценки качества позы для склейки
+    # ──────────────────────────────────────────────────────────────────────
 
-    def _get_direction(self, kp: np.ndarray) -> str:
-        """Определяет ориентацию тела по плечам и бёдрам."""
+    def get_cut_score(self, kp_sequence: list[np.ndarray]) -> float:
+        """
+        Оценить, насколько хороша поза для склейки (cut point).
+        
+        Метрика состоит из трёх компонентов:
+        1. Симметрия (0.4) — разница между левой и правой стороной тела
+        2. Центрирование (0.3) — насколько нос/центр плеч близок к центру кадра
+        3. Стабильность (0.3) — насколько мала дисперсия ключевых точек за 3 кадра
+        
+        Возвращает float в диапазоне [0, 1], где 1.0 — идеальная поза для склейки.
+        
+        Parameters
+        ----------
+        kp_sequence : list[np.ndarray]
+            Последовательность ключевых точек (обычно 3 кадра).
+            Если один кадр — стабильность = 1.0.
+        
+        Returns
+        -------
+        float — cut_score в [0, 1]
+        """
+        if not kp_sequence:
+            return 0.0
+        
+        if len(kp_sequence) == 1:
+            kp = kp_sequence[0]
+            if kp.shape[0] < 17:
+                return 0.0
+            kp = kp[:17]
+            
+            # Вычисляем симметрию
+            symmetry_score = self._compute_symmetry(kp)
+            
+            # Вычисляем центрирование
+            centering_score = self._compute_centering(kp)
+            
+            # Для одной позы стабильность = 1.0
+            stability_score = 1.0
+            
+            # Составная оценка
+            cut_score = (
+                0.4 * symmetry_score +
+                0.3 * centering_score +
+                0.3 * stability_score
+            )
+            
+            return float(np.clip(cut_score, 0.0, 1.0))
+        
+        elif len(kp_sequence) >= 3:
+            # Берём последние 3 кадра
+            recent_kp = kp_sequence[-3:]
+            
+            # Средняя поза
+            avg_kp = np.mean(np.stack(recent_kp, axis=0), axis=0)
+            
+            # Вычисляем симметрию для средней позы
+            symmetry_score = self._compute_symmetry(avg_kp)
+            
+            # Вычисляем центрирование
+            centering_score = self._compute_centering(avg_kp)
+            
+            # Вычисляем стабильность по дисперсии
+            stability_score = self._compute_stability(recent_kp)
+            
+            # Составная оценка
+            cut_score = (
+                0.4 * symmetry_score +
+                0.3 * centering_score +
+                0.3 * stability_score
+            )
+            
+            return float(np.clip(cut_score, 0.0, 1.0))
+        
+        else:
+            # 2 кадра
+            avg_kp = np.mean(np.stack(kp_sequence, axis=0), axis=0)
+            symmetry_score = self._compute_symmetry(avg_kp)
+            centering_score = self._compute_centering(avg_kp)
+            stability_score = 0.8
+            
+            cut_score = (
+                0.4 * symmetry_score +
+                0.3 * centering_score +
+                0.3 * stability_score
+            )
+            
+            return float(np.clip(cut_score, 0.0, 1.0))
+
+    def _compute_symmetry(self, kp: np.ndarray) -> float:
+        """
+        Вычислить симметрию позы.
+        
+        Сравнивает левую и правую стороны тела:
+        - плечи
+        - локти
+        - запястья
+        - бёдра
+        - колени
+        - лодыжки
+        
+        Возвращает значение в [0, 1], где 1.0 — идеальная симметрия.
+        """
+        # Плечи
+        ls = kp[_KP["l_shoulder"]]
+        rs = kp[_KP["r_shoulder"]]
+        shoulder_sym = self._compute_symmetry_score(ls, rs)
+        
+        # Локти
+        le = kp[_KP["l_elbow"]]
+        re = kp[_KP["r_elbow"]]
+        elbow_sym = self._compute_symmetry_score(le, re)
+        
+        # Запястья
+        lw = kp[_KP["l_wrist"]]
+        rw = kp[_KP["r_wrist"]]
+        wrist_sym = self._compute_symmetry_score(lw, rw)
+        
+        # Бёдра
+        lh = kp[_KP["l_hip"]]
+        rh = kp[_KP["r_hip"]]
+        hip_sym = self._compute_symmetry_score(lh, rh)
+        
+        # Колени
+        lk = kp[_KP["l_knee"]]
+        rk = kp[_KP["r_knee"]]
+        knee_sym = self._compute_symmetry_score(lk, rk)
+        
+        # Лодыжки
+        la = kp[_KP["l_ankle"]]
+        ra = kp[_KP["r_ankle"]]
+        ankle_sym = self._compute_symmetry_score(la, ra)
+        
+        # Среднее по всем симметриям
+        scores = [
+            shoulder_sym, elbow_sym, wrist_sym,
+            hip_sym, knee_sym, ankle_sym
+        ]
+        
+        return float(np.mean(scores))
+
+    def _compute_symmetry_score(self, left: np.ndarray, right: np.ndarray) -> float:
+        """
+        Вычислить симметрию между левой и правой точками.
+        
+        Сравнивает высоту (y) и глубину (x) левой и правой точки.
+        Возвращает значение в [0, 1], где 1.0 — идеальная симметрия.
+        """
+        # Если точки не видны
+        if left[2] < self._conf or right[2] < self._conf:
+            return 0.0
+        
+        # Разница по высоте
+        dy = abs(left[1] - right[1])
+        
+        # Разница по горизонтали
+        dx = abs(left[0] - right[0])
+        
+        # Ожидаемая разница по высоте (плечи примерно на одной высоте)
+        expected_dy = 0.02  # 2% от высоты кадра
+        
+        # Ожидаемая разница по горизонтали (плечи симметричны)
+        expected_dx = 0.01  # 1% от ширины кадра
+        
+        # Вычисляем симметрию
+        dy_score = max(0.0, 1.0 - dy / max(expected_dy, 0.001))
+        dx_score = max(0.0, 1.0 - dx / max(expected_dx, 0.001))
+        
+        return float(0.5 * dy_score + 0.5 * dx_score)
+
+    def _compute_centering(self, kp: np.ndarray) -> float:
+        """
+        Вычислить насколько центр тела близок к центру кадра.
+        
+        Возвращает значение в [0, 1], где 1.0 — идеальное центрирование.
+        """
+        # Центр плеч
+        ls = kp[_KP["l_shoulder"]]
+        rs = kp[_KP["r_shoulder"]]
+        
+        if ls[2] < self._conf or rs[2] < self._conf:
+            return 0.0
+        
+        shoulder_center = np.array([(ls[0] + rs[0]) / 2, (ls[1] + rs[1]) / 2])
+        
+        # Центр кадра
+        frame_center = np.array([0.5, 0.5])
+        
+        # Расстояние до центра
+        dist = _distance(shoulder_center, frame_center)
+        
+        # Ожидаемое расстояние (чем ближе к 0, тем лучше)
+        max_dist = np.sqrt(0.5**2 + 0.5**2)  # диагональ от угла до центра
+        
+        score = max(0.0, 1.0 - dist / max_dist)
+        
+        return float(score)
+
+    def _compute_stability(self, kp_sequence: list[np.ndarray]) -> float:
+        """
+        Вычислить стабильность позы по дисперсии ключевых точек.
+        
+        Возвращает значение в [0, 1], где 1.0 — идеальная стабильность.
+        """
+        if len(kp_sequence) < 2:
+            return 1.0
+        
+        # Стакаем все точки
+        stacked = np.stack(kp_sequence, axis=0)  # (n_frames, 17, 3)
+        
+        # Вычисляем дисперсию по x и y
+        var_x = np.var(stacked[:, :, 0])
+        var_y = np.var(stacked[:, :, 1])
+        
+        # Средняя дисперсия
+        avg_var = (var_x + var_y) / 2
+        
+        # Ожидаемая дисперсия для стабильной позы
+        expected_var = 0.0001  # очень маленькая дисперсия
+        
+        score = max(0.0, 1.0 - avg_var / expected_var)
+        
+        return float(score)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # get_motion_vector() — Вектор движения
+    # ──────────────────────────────────────────────────────────────────────
+
+    def get_motion_vector(self, kp1: np.ndarray, kp2: np.ndarray) -> Tuple[float, float, float]:
+        """
+        Вычислить вектор движения между двумя кадрами.
+        
+        Возвращает кортеж (dx, dy, dz_approx), где:
+        - dx — движение по горизонтали (слева направо)
+        - dy — движение по вертикали (вверх вниз)
+        - dz_approx — приблизительное движение к/от камеры (по размеру тела)
+        
+        Parameters
+        ----------
+        kp1 : np.ndarray — Ключевые точки первого кадра (17, 3)
+        kp2 : np.ndarray — Ключевые точки второго кадра (17, 3)
+        
+        Returns
+        -------
+        Tuple[float, float, float] — вектор движения
+        """
+        if kp1.shape[0] < 17 or kp2.shape[0] < 17:
+            return (0.0, 0.0, 0.0)
+        
+        kp1 = kp1[:17]
+        kp2 = kp2[:17]
+        
+        # Вычисляем центроиды
+        center1 = self._compute_body_center(kp1)
+        center2 = self._compute_body_center(kp2)
+        
+        # Вектор перемещения центроида
+        dx = float(center2[0] - center1[0])
+        dy = float(center2[1] - center1[1])
+        
+        # Оцениваем движение к/от камеры по изменению размера тела
+        size1 = self._compute_body_size(kp1)
+        size2 = self._compute_body_size(kp2)
+        
+        if size1 > 0:
+            dz_approx = float((size2 - size1) / size1)
+        else:
+            dz_approx = 0.0
+        
+        return (dx, dy, dz_approx)
+
+    def _compute_body_center(self, kp: np.ndarray) -> np.ndarray:
+        """Вычислить центр тела по ключевым точкам."""
+        visible = kp[kp[:, 2] >= self._conf]
+        if len(visible) == 0:
+            return np.array([0.5, 0.5])
+        return np.mean(visible[:, :2], axis=0)
+
+    def _compute_body_size(self, kp: np.ndarray) -> float:
+        """Оценить размер тела по высоте от плеч до бёдер."""
         ls = kp[_KP["l_shoulder"]]
         rs = kp[_KP["r_shoulder"]]
         lh = kp[_KP["l_hip"]]
         rh = kp[_KP["r_hip"]]
+        
+        visible = []
+        if ls[2] >= self._conf:
+            visible.append(ls)
+        if rs[2] >= self._conf:
+            visible.append(rs)
+        if lh[2] >= self._conf:
+            visible.append(lh)
+        if rh[2] >= self._conf:
+            visible.append(rh)
+        
+        if len(visible) < 2:
+            return 1.0
+        
+        visible = np.array(visible)
+        
+        # Высота (y-координаты)
+        height = abs(visible[:, 1].max() - visible[:, 1].min())
+        
+        # Ширина (x-координаты)
+        width = abs(visible[:, 0].max() - visible[:, 0].min())
+        
+        return float(max(height, width))
 
-        visible = (ls[2] > self._conf and rs[2] > self._conf)
-        if not visible:
+    # ──────────────────────────────────────────────────────────────────────
+    # Внутренние методы
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _determine_primary_category(
+        self,
+        motion_magnitude: float,
+        direction: str,
+        cut_score: float,
+    ) -> str:
+        """
+        Определить primary категорию на основе признаков.
+        """
+        # 1. Static — нет движения
+        if motion_magnitude < _STATIC_MOTION_THRESHOLD:
+            return "static"
+        
+        # 2. Cut point — высокий cut_score
+        if cut_score >= _CUT_SCORE_MIN:
+            return "cut_point"
+        
+        # 3. Action peak — высокая скорость
+        if motion_magnitude > _ACTION_PEAK_MOTION:
+            return "action_peak"
+        
+        # 4. Direction categories
+        if direction == "left":
+            return "direction_RL"  # справа налево (видно справа)
+        elif direction == "right":
+            return "direction_LR"  # слева направо (видно слева)
+        elif direction == "forward" or direction == "back":
+            return "direction_FB"  # движение к/от камеры
+        
+        return "static"
+
+    def _compute_motion_magnitude(self, kp: np.ndarray) -> float:
+        """
+        Вычислить амплитуду движения для одной позы.
+        Для EDL-классификации одной позы считаем "движение" по смещению центра.
+        """
+        center = self._compute_body_center(kp)
+        
+        # Нормализованное расстояние от центра кадра
+        frame_center = np.array([0.5, 0.5])
+        dist = _distance(center, frame_center)
+        
+        return dist
+
+    def _get_direction(self, kp: np.ndarray) -> str:
+        """Определить направление тела."""
+        ls = kp[_KP["l_shoulder"]]
+        rs = kp[_KP["r_shoulder"]]
+        lh = kp[_KP["l_hip"]]
+        rh = kp[_KP["r_hip"]]
+        
+        if ls[2] < self._conf or rs[2] < self._conf:
             return "unknown"
-
+        
+        # Плечи видны
+        if lh[2] < self._conf or rh[2] < self._conf:
+            return "unknown"
+        
         # Ширина плеч
         shoulder_w = abs(ls[0] - rs[0])
         # Ширина бёдер
-        hip_w = abs(lh[0] - rh[0]) if (
-            lh[2] > self._conf and rh[2] > self._conf) else shoulder_w
-
-        # Соотношение видимой ширины к ожидаемой
-        ratio = shoulder_w / max(hip_w, 1e-6)
-
-        # Наклон оси плеч
-        dx = rs[0] - ls[0]
-        dy = rs[1] - ls[1]
-        angle = math.degrees(math.atan2(dy, dx))
-
-        if shoulder_w < 30:
+        hip_w = abs(lh[0] - rh[0])
+        
+        if shoulder_w < 0.03:
             # Боком
             if ls[0] < rs[0]:
                 return "right"
             else:
                 return "left"
-
-        # Уши для определения перед/зад
-        le = kp[_KP["l_ear"]]
-        re = kp[_KP["r_ear"]]
+        
+        # Нос для перед/зад
         nose = kp[_KP["nose"]]
-
-        if nose[2] > self._conf:
-            # Нос виден — лицом к камере или полуоборот
-            nose_x = nose[0]
+        
+        if nose[2] >= self._conf:
             center_x = (ls[0] + rs[0]) / 2
-            offset = (nose_x - center_x) / max(shoulder_w, 1)
-
+            offset = (nose[0] - center_x) / max(shoulder_w, 0.001)
+            
             if abs(offset) < 0.15:
                 return "forward"
             elif offset > 0:
@@ -318,308 +566,81 @@ class MotionClassifier:
                 return "forward-left"
         else:
             # Нос не виден — спиной
-            if le[2] > self._conf and re[2] > self._conf:
+            le = kp[_KP["l_ear"]]
+            re = kp[_KP["r_ear"]]
+            
+            if le[2] >= self._conf and re[2] >= self._conf:
                 ear_center = (le[0] + re[0]) / 2
-                center_x   = (ls[0] + rs[0]) / 2
-                offset = (ear_center - center_x) / max(shoulder_w, 1)
+                center_x = (ls[0] + rs[0]) / 2
+                offset = (ear_center - center_x) / max(shoulder_w, 0.001)
+                
                 if abs(offset) < 0.15:
                     return "back"
                 elif offset > 0:
                     return "back-right"
                 else:
                     return "back-left"
-            return "back"
+        
+        return "back"
+
+    def _get_direction_confidence(self, kp: np.ndarray) -> float:
+        """Оценить уверенность в определении направления."""
+        ls = kp[_KP["l_shoulder"]]
+        rs = kp[_KP["r_shoulder"]]
+        
+        if ls[2] < self._conf or rs[2] < self._conf:
+            return 0.0
+        
+        # Минимальная уверенность
+        min_conf = min(ls[2], rs[2])
+        
+        return float(min_conf)
+
+    def _get_category_label(self, category: str, lang: str) -> str:
+        """Получить человекочитаемое название категории."""
+        labels = {
+            "static": {"ru": "Статика", "en": "Static"},
+            "cut_point": {"ru": "Точка среза", "en": "Cut Point"},
+            "action_peak": {"ru": "Пик действия", "en": "Action Peak"},
+            "direction_LR": {"ru": "Слева направо", "en": "Left to Right"},
+            "direction_RL": {"ru": "Справа налево", "en": "Right to Left"},
+            "direction_FB": {"ru": "К/от камеры", "en": "To/Away Camera"},
+            "unknown": {"ru": "Неизвестно", "en": "Unknown"},
+        }
+        
+        return labels.get(category, labels["unknown"]).get(lang, category)
 
     def _direction_label(self, direction: str, lang: str) -> str:
-        _map = {
-            "forward":      {"ru": "Лицом к камере",    "en": "Facing camera"},
-            "right":        {"ru": "Смотрит вправо",    "en": "Facing right"},
-            "left":         {"ru": "Смотрит влево",     "en": "Facing left"},
-            "back":         {"ru": "Спиной к камере",   "en": "Facing away"},
-            "forward-right":{"ru": "Пол-оборота вправо","en": "Half-turn right"},
-            "forward-left": {"ru": "Пол-оборота влево", "en": "Half-turn left"},
-            "back-right":   {"ru": "Спиной-вправо",     "en": "Back-right"},
-            "back-left":    {"ru": "Спиной-влево",      "en": "Back-left"},
-            "unknown":      {"ru": "Неизвестно",        "en": "Unknown"},
+        """Получить метку направления."""
+        labels = {
+            "forward": {"ru": "Лицом", "en": "Facing"},
+            "forward-left": {"ru": "Лицом-влево", "en": "Forward-left"},
+            "forward-right": {"ru": "Лицом-вправо", "en": "Forward-right"},
+            "left": {"ru": "Слев", "en": "Left"},
+            "right": {"ru": "Справа", "en": "Right"},
+            "back": {"ru": "Спиной", "en": "Back"},
+            "back-left": {"ru": "Спиной-влево", "en": "Back-left"},
+            "back-right": {"ru": "Спиной-вправо", "en": "Back-right"},
+            "unknown": {"ru": "Неизвестно", "en": "Unknown"},
         }
-        return _map.get(direction, _map["unknown"])[lang]
+        
+        return labels.get(direction, labels["unknown"]).get(lang, direction)
 
-    # ── Классификация позы ────────────────────────────────────────────────
-
-    def _classify_pose(self, kp: np.ndarray) -> tuple[str, int, float]:
-        """
-        Возвращает (category_key, movement_index, confidence).
-        """
-        scores: dict[str, float] = {}
-
-        # Вычисляем признаки
-        arms_raised    = self._arms_raised(kp)
-        arms_asymm     = self._arms_asymmetric(kp)
-        legs_bent      = self._legs_bent(kp)
-        legs_wide      = self._legs_wide(kp)
-        torso_lean     = self._torso_lean(kp)
-        torso_twist    = self._torso_twist(kp)
-        kick_pose      = self._kick_pose(kp)
-        punch_pose     = self._punch_pose(kp)
-        squat_deep     = self._deep_squat(kp)
-        jump_pose      = self._jump_pose(kp)
-        bow_pose       = self._bow_pose(kp)
-        one_leg        = self._one_leg_raised(kp)
-
-        # ── Правила (приоритет сверху вниз) ──────────────────────────────
-
-        # Падение — экстремальный наклон корпуса
-        if torso_lean > 0.8:
-            scores["falls"] = torso_lean
-
-        # Единоборства
-        if kick_pose > 0.6:
-            scores["sports_fighting"] = kick_pose
-            return "sports_fighting", 1, kick_pose  # удар ногой
-        if punch_pose > 0.6:
-            scores["sports_fighting"] = punch_pose
-            return "sports_fighting", 0, punch_pose  # удар рукой
-
-        # Гимнастика
-        if arms_raised > 0.8 and legs_wide > 0.6:
-            return "sports_gymnastics", 0, 0.75      # стойка/колесо
-
-        # Упражнения
-        if squat_deep > 0.7:
-            return "exercise", 1, squat_deep          # приседание
-        if bow_pose > 0.65:
-            return "exercise", 2, bow_pose            # планка/наклон
-
-        # Танец — симметричные махи + наклон
-        if arms_asymm > 0.5 and torso_lean < 0.3:
-            return "dance", 0, arms_asymm
-
-        # Руки вверх
-        if arms_raised > 0.65:
-            if arms_asymm < 0.2:
-                return "arms", 5, arms_raised         # руки вверх
-            return "arms", 0, arms_raised             # поднятие руки
-
-        # Одна нога поднята
-        if one_leg > 0.6:
-            return "legs", 2, one_leg                 # мах ногой
-
-        # Ноги широко
-        if legs_wide > 0.55:
-            return "legs", 1, legs_wide               # выпад
-
-        # Ноги согнуты
-        if legs_bent > 0.5:
-            return "legs", 0, legs_bent               # приседание
-
-        # Поворот корпуса
-        if torso_twist > 0.5:
-            return "torso", 1, torso_twist
-
-        # Наклон
-        if torso_lean > 0.4:
-            return "torso", 0, torso_lean
-
-        # Жесты — руки на уровне груди, асимметрично
-        if arms_asymm > 0.3 and arms_raised < 0.4:
-            return "gestures", 3, arms_asymm
-
-        # Просто стоит / идёт
-        return "locomotion", 0, 0.4
-
-    # ── Признаки (features) ───────────────────────────────────────────────
-
-    def _get_kp(self, kp: np.ndarray, *names: str) -> list[Optional[np.ndarray]]:
-        """Возвращает точки с проверкой видимости."""
-        result = []
-        for name in names:
-            p = kp[_KP[name]]
-            result.append(p if p[2] > self._conf else None)
-        return result
-
-    def _arms_raised(self, kp: np.ndarray) -> float:
-        """Насколько руки подняты выше плеч (0–1)."""
-        ls, rs = kp[_KP["l_shoulder"]], kp[_KP["r_shoulder"]]
-        lw, rw = kp[_KP["l_wrist"]], kp[_KP["r_wrist"]]
-        lh, rh = kp[_KP["l_hip"]], kp[_KP["r_hip"]]
-
-        torso_h = abs(
-            ((ls[1] + rs[1]) / 2) - ((lh[1] + rh[1]) / 2)
-        ) or 1.0
-
-        scores = []
-        if ls[2] > self._conf and lw[2] > self._conf:
-            scores.append(max(0, (ls[1] - lw[1]) / torso_h))
-        if rs[2] > self._conf and rw[2] > self._conf:
-            scores.append(max(0, (rs[1] - rw[1]) / torso_h))
-        return float(np.mean(scores)) if scores else 0.0
-
-    def _arms_asymmetric(self, kp: np.ndarray) -> float:
-        """Асимметрия рук (0–1). Высокое = руки на разной высоте."""
-        lw = kp[_KP["l_wrist"]]
-        rw = kp[_KP["r_wrist"]]
-        ls = kp[_KP["l_shoulder"]]
-        rs = kp[_KP["r_shoulder"]]
-        if (lw[2] < self._conf or rw[2] < self._conf or
-                ls[2] < self._conf or rs[2] < self._conf):
-            return 0.0
-        torso_h = abs(ls[1] - kp[_KP["l_hip"]][1]) or 1.0
-        diff = abs(lw[1] - rw[1]) / torso_h
-        return float(min(1.0, diff))
-
-    def _legs_bent(self, kp: np.ndarray) -> float:
-        """Согнутость ног — угол в колене (0–1)."""
-        scores = []
-        for side in [("l_hip","l_knee","l_ankle"),
-                     ("r_hip","r_knee","r_ankle")]:
-            h, k, a = [kp[_KP[s]] for s in side]
-            if all(p[2] > self._conf for p in [h, k, a]):
-                ang = self._angle3(h[:2], k[:2], a[:2])
-                # 180° = прямая нога, 90° = сильно согнута
-                score = max(0.0, (180.0 - ang) / 90.0)
-                scores.append(min(1.0, score))
-        return float(np.mean(scores)) if scores else 0.0
-
-    def _legs_wide(self, kp: np.ndarray) -> float:
-        """Ноги широко расставлены (0–1)."""
-        la = kp[_KP["l_ankle"]]
-        ra = kp[_KP["r_ankle"]]
-        ls = kp[_KP["l_shoulder"]]
-        rs = kp[_KP["r_shoulder"]]
-        if (la[2] < self._conf or ra[2] < self._conf or
-                ls[2] < self._conf or rs[2] < self._conf):
-            return 0.0
-        ankle_w   = abs(la[0] - ra[0])
-        shoulder_w = abs(ls[0] - rs[0]) or 1.0
-        return float(min(1.0, ankle_w / shoulder_w / 1.5))
-
-    def _torso_lean(self, kp: np.ndarray) -> float:
-        """Наклон корпуса от вертикали (0–1)."""
-        ls = kp[_KP["l_shoulder"]]
-        rs = kp[_KP["r_shoulder"]]
-        lh = kp[_KP["l_hip"]]
-        rh = kp[_KP["r_hip"]]
-        if not all(p[2] > self._conf for p in [ls, rs, lh, rh]):
-            return 0.0
-        sc = np.array([(ls[0]+rs[0])/2, (ls[1]+rs[1])/2])
-        hc = np.array([(lh[0]+rh[0])/2, (lh[1]+rh[1])/2])
-        vec = sc - hc
-        length = np.linalg.norm(vec) or 1.0
-        # Угол от вертикали
-        angle = abs(math.degrees(math.atan2(vec[0], -vec[1])))
-        return float(min(1.0, angle / 45.0))
-
-    def _torso_twist(self, kp: np.ndarray) -> float:
-        """Скручивание корпуса — разница ширины плеч и бёдер (0–1)."""
-        ls = kp[_KP["l_shoulder"]]
-        rs = kp[_KP["r_shoulder"]]
-        lh = kp[_KP["l_hip"]]
-        rh = kp[_KP["r_hip"]]
-        if not all(p[2] > self._conf for p in [ls, rs, lh, rh]):
-            return 0.0
-        sw = abs(ls[0] - rs[0])
-        hw = abs(lh[0] - rh[0])
-        diff = abs(sw - hw) / max(sw, hw, 1.0)
-        return float(min(1.0, diff * 2))
-
-    def _kick_pose(self, kp: np.ndarray) -> float:
-        """Поза удара ногой (0–1)."""
-        for side in [("l_hip","l_knee","l_ankle"),
-                     ("r_hip","r_knee","r_ankle")]:
-            h, k, a = [kp[_KP[s]] for s in side]
-            opp_h = kp[_KP["r_hip" if side[0]=="l_hip" else "l_hip"]]
-            if all(p[2] > self._conf for p in [h, k, a, opp_h]):
-                # Нога поднята высоко
-                if k[1] < opp_h[1]:
-                    ang = self._angle3(h[:2], k[:2], a[:2])
-                    if ang < 150:
-                        return 0.8
-        return 0.0
-
-    def _punch_pose(self, kp: np.ndarray) -> float:
-        """Поза удара рукой (0–1)."""
-        for side in [("l_shoulder","l_elbow","l_wrist"),
-                     ("r_shoulder","r_elbow","r_wrist")]:
-            s, e, w = [kp[_KP[x]] for x in side]
-            if all(p[2] > self._conf for p in [s, e, w]):
-                ang = self._angle3(s[:2], e[:2], w[:2])
-                # Вытянутая рука + горизонтально
-                if ang > 160 and abs(w[1] - s[1]) < abs(w[0] - s[0]):
-                    return 0.75
-        return 0.0
-
-    def _deep_squat(self, kp: np.ndarray) -> float:
-        """Глубокое приседание (0–1)."""
-        lh = kp[_KP["l_hip"]]
-        rh = kp[_KP["r_hip"]]
-        lk = kp[_KP["l_knee"]]
-        rk = kp[_KP["r_knee"]]
-        la = kp[_KP["l_ankle"]]
-        ra = kp[_KP["r_ankle"]]
-        if not all(p[2] > self._conf for p in [lh,rh,lk,rk,la,ra]):
-            return 0.0
-        hip_y  = (lh[1] + rh[1]) / 2
-        knee_y = (lk[1] + rk[1]) / 2
-        # Бёдра близко к коленям по вертикали
-        dist = abs(hip_y - knee_y)
-        ref  = abs(lk[1] - la[1]) or 1.0
-        return float(min(1.0, max(0.0, 1.0 - dist / ref)))
-
-    def _jump_pose(self, kp: np.ndarray) -> float:
-        """Поза прыжка — ноги согнуты + корпус высоко (0–1)."""
-        return self._legs_bent(kp) * 0.5
-
-    def _bow_pose(self, kp: np.ndarray) -> float:
-        """Поза наклона вперёд / поклона (0–1)."""
-        lean = self._torso_lean(kp)
-        ls   = kp[_KP["l_shoulder"]]
-        lh   = kp[_KP["l_hip"]]
-        if ls[2] > self._conf and lh[2] > self._conf:
-            # Плечи ниже бёдер
-            if ls[1] > lh[1]:
-                return min(1.0, lean + 0.3)
-        return lean * 0.6
-
-    def _one_leg_raised(self, kp: np.ndarray) -> float:
-        """Одна нога поднята (0–1)."""
-        lk = kp[_KP["l_knee"]]
-        rk = kp[_KP["r_knee"]]
-        lh = kp[_KP["l_hip"]]
-        rh = kp[_KP["r_hip"]]
-        if not all(p[2] > self._conf for p in [lk,rk,lh,rh]):
-            return 0.0
-        hip_y  = (lh[1] + rh[1]) / 2
-        l_raised = max(0.0, hip_y - lk[1])
-        r_raised = max(0.0, hip_y - rk[1])
-        ref = abs(lh[1] - lk[1]) or 1.0
-        return float(min(1.0, max(l_raised, r_raised) / ref))
-
-    # ── Геометрия ─────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _angle3(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
-        """Угол в точке b (градусы)."""
-        v1 = a - b
-        v2 = c - b
-        n1 = np.linalg.norm(v1)
-        n2 = np.linalg.norm(v2)
-        if n1 < 1e-6 or n2 < 1e-6:
-            return 180.0
-        cos_a = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
-        return float(math.degrees(math.acos(cos_a)))
-
-    @staticmethod
-    def _unknown(lang: str) -> dict:
+    def _unknown(self, lang: str) -> dict:
+        """Вернуть неизвестную категорию."""
         return {
-            "category":   "other",
-            "label":      "Прочее" if lang == "ru" else "Other",
-            "movement":   "прочее" if lang == "ru" else "other",
-            "direction":  "unknown",
+            "primary_cat": "unknown",
+            "cut_score": 0.0,
+            "motion_vec": (0.0, 0.0, 0.0),
+            "direction": "unknown",
             "confidence": 0.0,
         }
 
 
+# ──────────────────────────────────────────────────────────────────────────
 # Глобальный экземпляр
+# ──────────────────────────────────────────────────────────────────────────
+
 _classifier = MotionClassifier()
 
 
@@ -631,3 +652,13 @@ def classify_match(match: dict, lang: str = "ru") -> str:
 def classify_pose(keypoints: np.ndarray, lang: str = "ru") -> dict:
     """Классификация одиночной позы."""
     return _classifier.classify(keypoints, lang)
+
+
+def get_cut_score(kp_sequence: list[np.ndarray]) -> float:
+    """Вычислить cut_score для позы/последовательности."""
+    return _classifier.get_cut_score(kp_sequence)
+
+
+def get_motion_vector(kp1: np.ndarray, kp2: np.ndarray) -> Tuple[float, float, float]:
+    """Вычислить вектор движения между двумя кадрами."""
+    return _classifier.get_motion_vector(kp1, kp2)

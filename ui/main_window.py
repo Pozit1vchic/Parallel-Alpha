@@ -59,8 +59,8 @@ try:
     )
 except ImportError:
     APP_DISPLAY_NAME   = "Parallel Finder"
-    APP_SHORT_VERSION  = "Alpha v13"
-    APP_BUILD_VERSION  = "v13.0.2.1"
+    APP_SHORT_VERSION  = "13.4.5"
+    APP_BUILD_VERSION  = "v13.4.5"
     APP_AUTHOR         = "Pozit1vchic"
     MODELS_DIR         = "models"
     DEFAULT_MODEL_NAME = "yolo11x-pose.pt"

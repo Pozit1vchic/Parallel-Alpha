@@ -9,7 +9,7 @@
     "last_opened_project": null
   },
   "language": {
-    "current": "en",
+    "current": "ru",
     "available": [
       "ru",
       "en"
@@ -53,7 +53,7 @@
     "show_similarity": true
   },
   "analysis": {
-    "threshold": 87,
+    "threshold": 90,
     "min_gap": 6,
     "quality": "maximum",
     "use_mirror": true,
@@ -71,7 +71,7 @@
     "scene_interval": 3
   },
   "models": {
-    "default_model": "yolo11x-pose.pt",
+    "default_model": "yolo26x-pose.pt",
     "models_dir": "models",
     "use_local_first": true,
     "auto_download": true,

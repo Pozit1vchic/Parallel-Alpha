@@ -22,13 +22,13 @@ from typing import Final
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # Full display name shown in UI window title, about screen, logs, builds.
-APP_DISPLAY_NAME: Final[str] = "Parallel Finder Alpha v13"
+APP_DISPLAY_NAME: Final[str] = "Parallel Alpha 13.4.5"
 
 # Short human-readable version label (for UI badges, splash, about).
-APP_SHORT_VERSION: Final[str] = "Alpha v13"
+APP_SHORT_VERSION: Final[str] = "13.4.5"
 
 # Numeric build version (for packaging, auto-update checks, crash reports).
-APP_BUILD_VERSION: Final[str] = "v13.0.2.4"
+APP_BUILD_VERSION: Final[str] = "v13.4.5"
 
 # Author / studio identifier.
 APP_AUTHOR: Final[str] = "Pozit1vchic"

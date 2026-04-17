@@ -9,15 +9,15 @@ from ui.widgets.glow_button import GlowButton
 from ui.widgets.virtual_list import VirtualResultsList
 
 _UI: dict[str, dict[str, str]] = {
-    "results":    {"ru": "Результаты",         "en": "Results"},
-    "prev":       {"ru": "◀ Пред.",             "en": "◀ Prev"},
-    "next":       {"ru": "След. ▶",             "en": "Next ▶"},
+    "results":    {"ru": "Результаты",          "en": "Results"},
+    "prev":       {"ru": "◀ Пред.",              "en": "◀ Prev"},
+    "next":       {"ru": "След. ▶",              "en": "Next ▶"},
     "no_results": {"ru": "Результатов пока нет.\nЗапустите анализ.",
                    "en": "No results yet.\nRun analysis."},
-    "categories": {"ru": "Категории движений", "en": "Motion categories"},
-    "all":        {"ru": "Все",                "en": "All"},
-    "done_found": {"ru": "Готово. Найдено",    "en": "Done. Found"},
-    "repeats":    {"ru": "повторов",           "en": "repeats"},
+    "categories": {"ru": "Категории движений",  "en": "Motion categories"},
+    "all":        {"ru": "Все",                 "en": "All"},
+    "done_found": {"ru": "Готово. Найдено",     "en": "Done. Found"},
+    "repeats":    {"ru": "повторов",            "en": "repeats"},
 }
 
 
@@ -76,10 +76,11 @@ class ResultsPanel(tk.Frame):
         c    = self.colors
         lang = self._lang
 
+        # Внешний контейнер
         inner = tk.Frame(self, bg=c["card"], padx=14, pady=12)
         inner.pack(fill=tk.BOTH, expand=True)
 
-        # Заголовок
+        # ── Заголовок ─────────────────────────────────────────────────
         self._title_lbl = tk.Label(
             inner,
             text=_UI["results"][lang],
@@ -87,7 +88,7 @@ class ResultsPanel(tk.Frame):
             bg=c["card"], fg=c["text"])
         self._title_lbl.pack(anchor="w", pady=(0, 8))
 
-        # Навигация
+        # ── Навигация (Пред / счётчик / След) ─────────────────────────
         nav = tk.Frame(inner, bg=c["card"])
         nav.pack(fill=tk.X, pady=(0, 6))
 
@@ -116,7 +117,7 @@ class ResultsPanel(tk.Frame):
             width=80, height=28)
         self.next_btn.pack(side=tk.RIGHT)
 
-        # Экспорт
+        # ── Экспорт ───────────────────────────────────────────────────
         exp_row = tk.Frame(inner, bg=c["card"])
         exp_row.pack(fill=tk.X, pady=(0, 8))
         for lbl, key in [("JSON", "on_export_json"),
@@ -132,7 +133,7 @@ class ResultsPanel(tk.Frame):
                 font=("Inter", 9, "bold")).pack(
                 side=tk.LEFT, padx=(0, 4))
 
-        # Заглушка «нет результатов»
+        # ── Заглушка «нет результатов» ────────────────────────────────
         self._no_results = tk.Frame(inner, bg=c["card"])
         self._no_results.pack(fill=tk.BOTH, expand=True)
         self._no_results_lbl = tk.Label(
@@ -143,29 +144,49 @@ class ResultsPanel(tk.Frame):
             justify="center")
         self._no_results_lbl.pack(expand=True)
 
-        # Категории
+        # ── Категории (изначально скрыты) ─────────────────────────────
         self._cats_frame = tk.Frame(inner, bg=c["card"])
         self._cats_title_lbl: tk.Label | None = None
 
-        # Список
+        # ── Контейнер списка (изначально скрыт) ──────────────────────
+        # fill=BOTH + expand=True — критично чтобы список занял место
         self._list_outer = tk.Frame(inner, bg=c["card"])
+
+        # VirtualResultsList сам запакует себя внутри _list_outer
         self.vlist = VirtualResultsList(
-            self._list_outer, c,
+            self._list_outer,
+            c,
             on_select=self.callbacks.get(
                 "on_select", lambda _: None),
             lang=lang)
+
+        # _list_outer НЕ пакуем здесь — он появится в show_results()
 
     # ── Публичный API ─────────────────────────────────────────────────────
 
     def show_results(self,
                      matches:    list,
                      categories: list[str]) -> None:
+        """Показать результаты: скрыть заглушку, показать список."""
+        # 1. Убираем заглушку
         self._no_results.pack_forget()
+
+        # 2. Строим кнопки категорий
         self._rebuild_categories(categories)
+
+        # 3. Показываем контейнер списка с fill+expand
         self._list_outer.pack(fill=tk.BOTH, expand=True)
+
+        # 4. Передаём данные в виртуальный список
         self.vlist.set_matches(matches)
+        
+        # 5. Принудительно обновляем scrollregion и рендер после set_matches
+        # Это гарантирует корректный расчет высоты контента перед первой отрисовкой
+        self.vlist._update_scrollregion()
+        self.vlist._render()
 
     def hide_results(self) -> None:
+        """Скрыть список и показать заглушку."""
         self._cats_frame.pack_forget()
         self._list_outer.pack_forget()
         self._no_results.pack(fill=tk.BOTH, expand=True)
@@ -177,8 +198,8 @@ class ResultsPanel(tk.Frame):
 
     # ── Категории ─────────────────────────────────────────────────────────
 
-    def _rebuild_categories(self,
-                             categories: list[str]) -> None:
+    def _rebuild_categories(self, categories: list[str]) -> None:
+        """Перестроить кнопки фильтрации по категориям."""
         for w in self._cats_frame.winfo_children():
             w.destroy()
         self._cats_title_lbl = None
@@ -199,10 +220,10 @@ class ResultsPanel(tk.Frame):
             bg=c["card"], fg=c["text"])
         self._cats_title_lbl.pack(anchor="w", pady=(0, 4))
 
-        total  = len(self.state.matches)
-        btns:  dict[str, GlowButton] = {}
+        total = len(self.state.matches)
+        btns: dict[str, GlowButton] = {}
 
-        # Подсчёт по категориям
+        # Подсчёт матчей по категориям
         counts: dict[str, int] = {}
         for m in self.state.matches:
             cc = m.get("category", "")
@@ -213,10 +234,11 @@ class ResultsPanel(tk.Frame):
             def _cb():
                 self.state.active_filter_cat = cat
                 self.vlist.set_filter(cat=cat)
+                # Обновляем подсветку кнопок
                 for cc, b in btns.items():
-                    is_active = (self.state.active_filter_cat == cc)
-                    b.set_bg(c["accent"] if is_active
-                             else c["highlight"])
+                    b.set_bg(
+                        c["accent"] if cc == cat
+                        else c["highlight"])
             return _cb
 
         # Кнопка «Все»
@@ -234,7 +256,7 @@ class ResultsPanel(tk.Frame):
         all_btn.pack(anchor="w", pady=(0, 2))
         btns[""] = all_btn
 
-        # Кнопки категорий
+        # Кнопки отдельных категорий
         for cat in categories:
             cnt = counts.get(cat, 0)
             if cnt == 0:
