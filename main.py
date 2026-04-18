@@ -12,6 +12,11 @@ main.py — точка входа Parallel Finder Alpha v13.
 from __future__ import annotations
 
 import sys
+import io
+# Исправление кодировки консоли на Windows
+if sys.platform == 'win32':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 import os
 import traceback
 from pathlib import Path
@@ -159,19 +164,25 @@ def main() -> int:
         return 1
 
     # 4. Запуск
+    return_code = 0
     try:
         app = ParallelFinderApp()
         app.run()
-        return 0
-
     except KeyboardInterrupt:
         print("\n[main] Приложение остановлено пользователем (Ctrl+C).")
-        return 0
-
+        return_code = 0
     except Exception as exc:  # noqa: BLE001
         print(f"\n[main] ОШИБКА во время выполнения: {exc}")
         traceback.print_exc()
-        return 1
+        return_code = 1
+    finally:
+        # ── КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: принудительное завершение процесса ─────
+        # Tkinter на Windows оставляет процесс висеть после закрытия окна.
+        # os._exit() гарантированно убивает процесс, не дожидаясь потоков.
+        print("[main] Завершение процесса...")
+        os._exit(return_code)
+
+    return return_code
 
 
 # ─────────────────────────────────────────────────────────────────────────────

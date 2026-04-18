@@ -167,6 +167,7 @@ class ResultsPanel(tk.Frame):
     def show_results(self,
                      matches:    list,
                      categories: list[str]) -> None:
+        print(f"[ResultsPanel] Получено {len(matches)} совпадений")
         """Показать результаты: скрыть заглушку, показать список."""
         # 1. Убираем заглушку
         self._no_results.pack_forget()
@@ -189,6 +190,7 @@ class ResultsPanel(tk.Frame):
 
         # Передаём данные в виртуальный список
         self.vlist.set_matches(matches)
+        print(f"[ResultsPanel] vlist.get_visible_count() = {self.vlist.get_visible_count()}")
 
     def hide_results(self) -> None:
         """Скрыть список и показать заглушку."""

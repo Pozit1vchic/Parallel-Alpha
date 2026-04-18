@@ -186,6 +186,7 @@ def _pickle_gz(obj: Any) -> bytes:
 def _unpickle_gz(data: bytes) -> Any:
     """Десериализовать из gzip-pickle bytes."""
     with gzip.GzipFile(fileobj=io.BytesIO(data), mode="rb") as gz:
+        # Десериализация из gzip-pickle (сжатие для экономии места в файлах проекта)
         return pickle.load(gz)
 
 

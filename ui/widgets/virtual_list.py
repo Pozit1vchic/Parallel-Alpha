@@ -106,12 +106,14 @@ class VirtualResultsList(SmoothScrollMixin):
     # ── Публичный API ─────────────────────────────────────────────────────
 
     def set_matches(self, matches: list[dict]) -> None:
+        print(f"[VList] set_matches: {len(matches)} матчей")
         self._all_matches = matches
         self._hidden_set.clear()
         self._selected_fi = -1
         self._apply_filter()
         if hasattr(self, '_canvas') and self._canvas and self._canvas.winfo_exists():
             self._canvas.yview_moveto(0)
+        print(f"[VList] _filtered: {len(self._filtered)}")    
         self._refresh()
 
     def select_by_match_idx(self, mi: int) -> None:
@@ -252,6 +254,7 @@ class VirtualResultsList(SmoothScrollMixin):
                 (item_bot - ch) / max(total_h, 1))
 
     def _render(self) -> None:
+        print(f"[VList] _render: filtered={len(self._filtered)}, cw={self._canvas.winfo_width()}, ch={self._canvas.winfo_height()}")
         c = self.colors
 
         cw = max(self._canvas.winfo_width(), 1)

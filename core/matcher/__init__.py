@@ -1,27 +1,26 @@
-"""
-Реэкспорт для обратной совместимости.
-Старый код: from core.matcher import MotionMatcher — работает без изменений.
-"""
-from core.matcher.motion_matcher import MotionMatcher
-from core.matcher.pose_processor import (
-    preprocess_pose,
+# Core matcher module
+from .pose_processor import (
     is_pose_valid,
+    preprocess_pose,
+    batch_preprocess_poses,
+    compute_pose_features,
     mirror_vectors,
     build_poses_tensor,
-    BODY_WEIGHTS,
     COCO_N_KPS,
     ANCHOR_KPS,
-    MIRROR_PAIRS,
+    BODY_WEIGHTS,
 )
+from .motion_matcher import MotionMatcher
 
 __all__ = [
-    "MotionMatcher",
-    "preprocess_pose",
     "is_pose_valid",
+    "preprocess_pose",
+    "batch_preprocess_poses",
+    "compute_pose_features",
     "mirror_vectors",
     "build_poses_tensor",
-    "BODY_WEIGHTS",
+    "MotionMatcher",
     "COCO_N_KPS",
     "ANCHOR_KPS",
-    "MIRROR_PAIRS",
+    "BODY_WEIGHTS",
 ]

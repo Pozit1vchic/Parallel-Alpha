@@ -125,7 +125,7 @@ class VideoMeta:
     fps:          float
     total_frames: int
     width:        int
-    height:       int
+    height:        int
 
     @property
     def duration(self) -> float:
@@ -612,6 +612,7 @@ class AnalysisBackend:
                 min_gap      = min_gap,
                 use_mirror   = use_mirror,
             )
+            print(f"[Backend] Матчер вернул {len(matches)} совпадений")
 
             # ── Фото-фильтрация (если включена) ───────────────────────────
             if self._photo_matcher is not None:
@@ -645,6 +646,7 @@ class AnalysisBackend:
             self._emit_error("Ошибка в ходе анализа", exc)
 
         finally:
+            print(f"[Backend] _finalize вызывается")
             self._finalize(result, t_start)
 
     # ── PERSON_SEARCH ─────────────────────────────────────────────────────
@@ -904,10 +906,18 @@ class AnalysisBackend:
                 """
                 if not bf:
                     return
-                # Оптимизация: ресайзить батч ТОЛЬКО перед YOLO (не для каждого кадра отдельно)
-                resized_frames = [_resize_frame(f, MAX_FRAME_SIDE) for f in bf]
+                # Ресайз до 848px (уменьшает GPU transfer в 5 раз)
+                resized = []
+                for f in bf:
+                    h, w = f.shape[:2]
+                    if w > 848:
+                        scale = 848 / w
+                        new_h = int(h * scale)
+                        resized.append(cv2.resize(f, (848, new_h), interpolation=cv2.INTER_AREA))
+                    else:
+                        resized.append(f)
                 try:
-                    detections = self.yolo.detect_batch(resized_frames)
+                    detections = self.yolo.detect_batch(resized)
                 except Exception as exc:
                     logger.error(f"Ошибка detect_batch: {exc}")
                     return
@@ -934,15 +944,16 @@ class AnalysisBackend:
 
             # ── Основной цикл ─────────────────────────────────────────────
             while cap.isOpened() and not self._stop_event.is_set():
-                ret, frame = cap.read()
+                ret = cap.grab()
                 if not ret:
                     break
-
+                
                 if frame_idx % skip == 0:
-                    # Оптимизация: сохраняем ОРИГИНАЛЬНЫЕ кадры, ресайз будет в _flush_batch()
-                    batch_frames.append(frame)
-                    batch_frame_ids.append(frame_idx)
-                    processed_count += 1
+                    ret, frame = cap.retrieve()
+                    if ret:
+                        batch_frames.append(frame)
+                        batch_frame_ids.append(frame_idx)
+                        processed_count += 1
 
                 if len(batch_frames) >= dyn_batch:
                     _flush_batch(batch_frames, batch_frame_ids)
@@ -950,6 +961,15 @@ class AnalysisBackend:
                     batch_frame_ids = []
 
                 frame_idx += 1
+                
+                # Исправлено: fps_window теперь заполняется корректно
+                if frame_idx % 10 == 0 and total_frames > 0:
+                    t_now = time.monotonic()
+                    dt = t_now - t_prev
+                    if dt > 0:
+                        fps_window.append(10.0 / dt)
+                    t_prev = t_now
+                
                 t_now_ui = time.perf_counter()
                 if t_now_ui - _last_ui_update >= _ui_update_interval:
                     local_pct = frame_idx / total_frames

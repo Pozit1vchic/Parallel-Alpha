@@ -13,6 +13,7 @@ import sys
 import warnings
 from pathlib import Path
 from threading import Thread
+from ui.widgets.glow_button import GlowButton
 
 import cv2
 import numpy as np
@@ -123,8 +124,6 @@ from ui.controllers.analysis_controller import AnalysisController
 from ui.controllers.model_controller import ModelController
 from ui.controllers.export_controller import ExportController
 from ui.controllers.navigation_controller import NavigationController
-from ui.widgets.glow_button import GlowButton
-
 warnings.filterwarnings("ignore")
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
@@ -1082,6 +1081,7 @@ class ParallelFinderApp:
             pass
 
     def _on_analysis_complete(self, matches: list) -> None:
+        print(f"[MainWindow] Получено {len(matches)} совпадений")
         try:
             self.state.matches          = matches
             self.state.analysis_running = False
@@ -1121,6 +1121,9 @@ class ParallelFinderApp:
             gc.collect()
 
     def _process_matches(self, matches: list) -> None:
+        print(f"[MainWindow] _process_matches: {len(matches)}")
+        print(f"[MainWindow] found_categories: {self.state.found_categories}")
+        self._results_panel.show_results(matches, self.state.found_categories)
         self._classifier.lang = self._lang
         self.state.found_categories = self._classifier.classify_all(
             matches)

@@ -1,0 +1,440 @@
+F841 Local variable `scaled_w` is assigned to but never used
+   --> core\analysis_backend.py:863:13
+    |
+861 |             scale     = min(MAX_FRAME_SIDE / max(width, 1),
+862 |                             MAX_FRAME_SIDE / max(height, 1), 1.0)
+863 |             scaled_w  = max(1, int(width  * scale))
+    |             ^^^^^^^^
+864 |             scaled_h  = max(1, int(height * scale))
+865 |             dyn_batch = self.yolo.get_batch_size()
+    |
+help: Remove assignment to unused variable `scaled_w`
+
+F841 Local variable `scaled_h` is assigned to but never used
+   --> core\analysis_backend.py:864:13
+    |
+862 |                             MAX_FRAME_SIDE / max(height, 1), 1.0)
+863 |             scaled_w  = max(1, int(width  * scale))
+864 |             scaled_h  = max(1, int(height * scale))
+    |             ^^^^^^^^
+865 |             dyn_batch = self.yolo.get_batch_size()
+    |
+help: Remove assignment to unused variable `scaled_h`
+
+F841 Local variable `video_hash` is assigned to but never used
+   --> core\analysis_backend.py:868:13
+    |
+867 |             # Исправлено: хэш по содержимому файла
+868 |             video_hash = _compute_file_hash(path)
+    |             ^^^^^^^^^^
+869 |             frames_data: list[dict] = []
+    |
+help: Remove assignment to unused variable `video_hash`
+
+F841 Local variable `kp_list` is assigned to but never used
+   --> core\analysis_backend.py:930:21
+    |
+928 |                     # keypoints уже в формате numpy array (17, 3)
+929 |                     keypoints = det.get("keypoints")
+930 |                     kp_list = keypoints.tolist() if isinstance(keypoints, np.ndarray) else keypoints
+    |                     ^^^^^^^
+931 |
+932 |                     frames_data.append({
+    |
+help: Remove assignment to unused variable `kp_list`
+
+F401 [*] `hashlib` imported but unused
+  --> core\engine\model_manager.py:15:8
+   |
+13 | from __future__ import annotations
+14 |
+15 | import hashlib
+   |        ^^^^^^^
+16 | import shutil
+17 | import threading
+   |
+help: Remove unused import: `hashlib`
+
+F541 [*] f-string without any placeholders
+   --> core\engine\model_manager.py:241:25
+    |
+239 |                     # Продолжаем без локального кеша
+240 |                     print(
+241 |                         f"[ModelManager] ⚠ Файл не найден в кеше, "
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+242 |                         f"продолжаем без кеширования."
+243 |                     )
+    |
+help: Remove extraneous `f` prefix
+
+F541 [*] f-string without any placeholders
+   --> core\engine\model_manager.py:242:25
+    |
+240 |                     print(
+241 |                         f"[ModelManager] ⚠ Файл не найден в кеше, "
+242 |                         f"продолжаем без кеширования."
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+243 |                     )
+    |
+help: Remove extraneous `f` prefix
+
+F401 `cv2` imported but unused; consider using `importlib.util.find_spec` to test for availability
+   --> core\engine\yolo_engine.py:130:20
+    |
+128 |         """Запустить асинхронный предзагрузчик кадров."""
+129 |         try:
+130 |             import cv2
+    |                    ^^^
+131 |         except ImportError:
+132 |             return
+    |
+help: Remove unused import: `cv2`
+
+F401 [*] `core.matcher.pose_processor.COCO_N_KPS` imported but unused
+  --> core\matcher\motion_matcher.py:62:57
+   |
+60 |     TSLearn_AVAILABLE = False
+61 |
+62 | from core.matcher.pose_processor import mirror_vectors, COCO_N_KPS, ANCHOR_KPS_ARR
+   |                                                         ^^^^^^^^^^
+63 |
+64 | log = logging.getLogger(__name__)
+   |
+help: Remove unused import
+
+F401 [*] `core.matcher.pose_processor.ANCHOR_KPS_ARR` imported but unused
+  --> core\matcher\motion_matcher.py:62:69
+   |
+60 |     TSLearn_AVAILABLE = False
+61 |
+62 | from core.matcher.pose_processor import mirror_vectors, COCO_N_KPS, ANCHOR_KPS_ARR
+   |                                                                     ^^^^^^^^^^^^^^
+63 |
+64 | log = logging.getLogger(__name__)
+   |
+help: Remove unused import
+
+F401 [*] `torch` imported but unused
+  --> core\motion_classifier.py:10:8
+   |
+ 9 | import numpy as np
+10 | import torch
+   |        ^^^^^
+11 | from typing import Optional, Tuple
+   |
+help: Remove unused import: `torch`
+
+F841 Local variable `hip_w` is assigned to but never used
+   --> core\motion_classifier.py:545:9
+    |
+543 |         shoulder_w = abs(ls[0] - rs[0])
+544 |         # Ширина бёдер
+545 |         hip_w = abs(lh[0] - rh[0])
+    |         ^^^^^
+546 |         
+547 |         if shoulder_w < 0.03:
+    |
+help: Remove assignment to unused variable `hip_w`
+
+F401 [*] `os` imported but unused
+  --> core\project.py:22:8
+   |
+20 | import json
+21 | import logging
+22 | import os
+   |        ^^
+23 | import pickle
+24 | import shutil
+   |
+help: Remove unused import: `os`
+
+F401 [*] `os` imported but unused
+  --> main.py:15:8
+   |
+14 | import sys
+15 | import os
+   |        ^^
+16 | import traceback
+17 | from pathlib import Path
+   |
+help: Remove unused import: `os`
+
+F841 Local variable `device` is assigned to but never used
+   --> main.py:101:9
+    |
+ 99 |     try:
+100 |         import torch
+101 |         device = "CUDA" if torch.cuda.is_available() else "CPU"
+    |         ^^^^^^
+102 |         if torch.cuda.is_available():
+103 |             gpu_name = torch.cuda.get_device_name(0)
+    |
+help: Remove assignment to unused variable `device`
+
+F401 [*] `core.matcher.pose_processor.preprocess_pose` imported but unused
+  --> ui\controllers\analysis_controller.py:18:5
+   |
+16 | from ui.app_state import AppState
+17 | from core.matcher.pose_processor import (
+18 |     preprocess_pose,
+   |     ^^^^^^^^^^^^^^^
+19 |     is_pose_valid,
+20 |     compute_pose_features,
+   |
+help: Remove unused import: `core.matcher.pose_processor.preprocess_pose`
+
+F401 `core.analysis_backend.SearchMode` imported but unused; consider using `importlib.util.find_spec` to test for availability
+  --> ui\controllers\analysis_controller.py:29:9
+   |
+27 |         AnalysisProgress,
+28 |         AnalysisResult,
+29 |         SearchMode,
+   |         ^^^^^^^^^^
+30 |     )
+31 |     _HAS_BACKEND = True
+   |
+help: Remove unused import: `core.analysis_backend.SearchMode`
+
+F401 [*] `gc` imported but unused
+  --> ui\controllers\foolproof.py:9:8
+   |
+ 8 | import os
+ 9 | import gc
+   |        ^^
+10 | import time
+11 | import shutil
+   |
+help: Remove unused import: `gc`
+
+F401 [*] `time` imported but unused
+  --> ui\controllers\foolproof.py:10:8
+   |
+ 8 | import os
+ 9 | import gc
+10 | import time
+   |        ^^^^
+11 | import shutil
+12 | from pathlib import Path
+   |
+help: Remove unused import: `time`
+
+F401 [*] `typing.Callable` imported but unused
+  --> ui\controllers\foolproof.py:13:20
+   |
+11 | import shutil
+12 | from pathlib import Path
+13 | from typing import Callable
+   |                    ^^^^^^^^
+14 |
+15 | import tkinter as tk
+   |
+help: Remove unused import: `typing.Callable`
+
+F841 Local variable `free` is assigned to but never used
+   --> ui\controllers\foolproof.py:323:17
+    |
+321 |             if torch.cuda.is_available():
+322 |                 vram = torch.cuda.get_device_properties(0).total_memory
+323 |                 free = torch.cuda.memory_reserved(0)
+    |                 ^^^^
+324 |                 if vram < 2 * 1024 ** 3:
+325 |                     warn_once(
+    |
+help: Remove assignment to unused variable `free`
+
+F401 [*] `tkinter.messagebox` imported but unused
+  --> ui\dialogs\model_selector.py:8:21
+   |
+ 6 | from __future__ import annotations
+ 7 | import tkinter as tk
+ 8 | from tkinter import messagebox
+   |                     ^^^^^^^^^^
+ 9 | from typing import Callable
+10 | from utils.locales import t
+   |
+help: Remove unused import: `tkinter.messagebox`
+
+F401 [*] `sys` imported but unused
+  --> ui\main_window.py:12:8
+   |
+10 | import platform
+11 | import subprocess
+12 | import sys
+   |        ^^^
+13 | import warnings
+14 | from pathlib import Path
+   |
+help: Remove unused import: `sys`
+
+F401 [*] `threading.Thread` imported but unused
+  --> ui\main_window.py:15:23
+   |
+13 | import warnings
+14 | from pathlib import Path
+15 | from threading import Thread
+   |                       ^^^^^^
+16 |
+17 | import cv2
+   |
+help: Remove unused import: `threading.Thread`
+
+F401 `core.project.ProjectManager` imported but unused; consider using `importlib.util.find_spec` to test for availability
+  --> ui\main_window.py:48:30
+   |
+47 | try:
+48 |     from core.project import ProjectManager
+   |                              ^^^^^^^^^^^^^^
+49 |     _HAS_PROJECT = True
+50 | except ImportError:
+   |
+help: Remove unused import: `core.project.ProjectManager`
+
+F841 Local variable `device` is assigned to but never used
+   --> ui\main_window.py:780:17
+    |
+778 |         if _HAS_BACKEND:
+779 |             try:
+780 |                 device       = "cuda" if torch.cuda.is_available() else None
+    |                 ^^^^^^
+781 |                 self.backend = AnalysisBackend()
+782 |                 self.backend.yolo = self.yolo
+    |
+help: Remove assignment to unused variable `device`
+
+F401 [*] `typing.Callable` imported but unused
+ --> ui\panels\preview_panel.py:6:20
+  |
+4 | from __future__ import annotations
+5 |
+6 | from typing import Callable
+  |                    ^^^^^^^^
+7 |
+8 | import numpy as np
+  |
+help: Remove unused import: `typing.Callable`
+
+F401 [*] `typing.Callable` imported but unused
+ --> ui\panels\results_panel.py:5:20
+  |
+4 | import tkinter as tk
+5 | from typing import Callable
+  |                    ^^^^^^^^
+6 |
+7 | from ui.app_state import AppState
+  |
+help: Remove unused import: `typing.Callable`
+
+E741 Ambiguous variable name: `l`
+   --> ui\panels\settings_panel.py:817:39
+    |
+815 |             sliderlength=18, width=8,
+816 |             showvalue=False,
+817 |             command=lambda v, u=unit, l=val_lbl:
+    |                                       ^
+818 |                 l.config(text=f"{int(float(v))}{u}"),
+819 |         ).pack(fill=tk.X)
+    |
+
+F841 Local variable `q_for_backend` is assigned to but never used
+   --> ui\panels\settings_panel.py:867:13
+    |
+865 |             # Для backend передаём русское значение (QUALITY_FPS использует русские ключи)
+866 |             q_key      = self.quality.get()           # "fast"/"medium"/"maximum"
+867 |             q_for_backend = _t(q_key, "ru")           # "Быстро"/"Средне"/"Максимум"
+    |             ^^^^^^^^^^^^^
+868 |
+869 |             cfg.setdefault("analysis", {}).update({
+    |
+help: Remove assignment to unused variable `q_for_backend`
+
+F401 [*] `os` imported but unused
+ --> utils\auto_tune.py:6:8
+  |
+4 | from __future__ import annotations
+5 |
+6 | import os
+  |        ^^
+7 | import platform
+8 | import sys
+  |
+help: Remove unused import: `os`
+
+F401 [*] `sys` imported but unused
+  --> utils\auto_tune.py:8:8
+   |
+ 6 | import os
+ 7 | import platform
+ 8 | import sys
+   |        ^^^
+ 9 | from dataclasses import dataclass, field
+10 | from typing import Optional
+   |
+help: Remove unused import: `sys`
+
+E402 Module level import not at top of file
+  --> utils\constants.py:15:1
+   |
+13 | """
+14 |
+15 | import os
+   | ^^^^^^^^^
+16 | import sys
+17 | from pathlib import Path
+   |
+
+E402 Module level import not at top of file
+  --> utils\constants.py:16:1
+   |
+15 | import os
+16 | import sys
+   | ^^^^^^^^^^
+17 | from pathlib import Path
+18 | from typing import Final
+   |
+
+E402 Module level import not at top of file
+  --> utils\constants.py:17:1
+   |
+15 | import os
+16 | import sys
+17 | from pathlib import Path
+   | ^^^^^^^^^^^^^^^^^^^^^^^^
+18 | from typing import Final
+   |
+
+E402 Module level import not at top of file
+  --> utils\constants.py:18:1
+   |
+16 | import sys
+17 | from pathlib import Path
+18 | from typing import Final
+   | ^^^^^^^^^^^^^^^^^^^^^^^^
+19 |
+20 | # ═══════════════════════════════════════════════════════════════════════════════
+   |
+
+F401 [*] `os` imported but unused
+  --> utils\helpers.py:9:8
+   |
+ 8 | import hashlib
+ 9 | import os
+   |        ^^
+10 | from pathlib import Path
+11 | from typing import TypeAlias
+   |
+help: Remove unused import: `os`
+
+F401 `PyQt5.QtCore.Qt` imported but unused; consider using `importlib.util.find_spec` to test for availability
+   --> utils\helpers.py:200:38
+    |
+198 |         try:
+199 |             from PyQt5.QtGui import QPixmap, QImage
+200 |             from PyQt5.QtCore import Qt
+    |                                      ^^
+201 |             data = img.tobytes("raw", "RGB")
+202 |             qimg = QImage(data, img.width, img.height,
+    |
+help: Remove unused import: `PyQt5.QtCore.Qt`
+
+Found 38 errors.
+[*] 20 fixable with the `--fix` option (9 hidden fixes can be enabled with the `--unsafe-fixes` option).

@@ -53,7 +53,7 @@
     "show_similarity": true
   },
   "analysis": {
-    "threshold": 90,
+    "threshold": 92,
     "min_gap": 6,
     "quality": "maximum",
     "use_mirror": true,

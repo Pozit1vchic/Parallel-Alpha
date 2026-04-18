@@ -50,36 +50,36 @@ _FIRST_LAUNCH = {
 class ModelLoadingOverlay:
     def __init__(self, root: tk.Tk, colors: dict,
                  lang: str = "ru") -> None:
-        self.root           = root
-        self.colors         = colors
-        self.lang           = lang
-        self._frame         = None
-        self._spinner_cv    = None
-        self._prog_cv       = None
-        self._ring_cv       = None
-        self._title_var     = None
-        self._sub_var       = None
-        self._model_var     = None
-        self._stage_var     = None
-        self._hint_var      = None
-        self._prog_var      = None
-        self._pct_lbl       = None
-        self._hint_lbl      = None
-        self._first_lbl     = None   # ссылка на «первый запуск»
-        self._anim_id       = None
-        self._dot_id        = None
-        self._hint_id       = None
-        self._angle         = 0.0
-        self._angle2        = 0.0
-        self._dots          = 0
-        self._pulse         = 0.0
-        self._hint_idx      = 0
-        self._hint_fade     = 1.0
-        self._hint_fading   = False
-        self.current_value  = 0.0
-        self._model_name    = ""
-        self._success_pulse = 0.0
-        self._success_mode  = False
+        self.root: tk.Tk = root
+        self.colors: dict = colors
+        self.lang: str = lang
+        self._frame: tk.Frame | None = None
+        self._spinner_cv: tk.Canvas | None = None
+        self._prog_cv: tk.Canvas | None = None
+        self._ring_cv: tk.Canvas | None = None
+        self._title_var: tk.StringVar | None = None
+        self._sub_var: tk.StringVar | None = None
+        self._model_var: tk.StringVar | None = None
+        self._stage_var: tk.StringVar | None = None
+        self._hint_var: tk.StringVar | None = None
+        self._prog_var: tk.DoubleVar | None = None
+        self._pct_lbl: tk.Label | None = None
+        self._hint_lbl: tk.Label | None = None
+        self._first_lbl: tk.Label | None = None
+        self._anim_id: int | None = None
+        self._dot_id: int | None = None
+        self._hint_id: int | None = None
+        self._angle: float = 0.0
+        self._angle2: float = 0.0
+        self._dots: int = 0
+        self._pulse: float = 0.0
+        self._hint_idx: int = 0
+        self._hint_fade: float = 1.0
+        self._hint_fading: bool = False
+        self.current_value: float = 0.0
+        self._model_name: str = ""
+        self._success_pulse: float = 0.0
+        self._success_mode: bool = False
 
     # ── Public ────────────────────────────────────────────────────────────
 
@@ -88,9 +88,9 @@ class ModelLoadingOverlay:
              model_name: str = "") -> None:
         if self._frame and self._frame.winfo_exists():
             self.hide()
-        self.current_value  = 0.0
-        self._success_mode  = False
-        self._model_name    = model_name or self._extract_model(title)
+        self.current_value = 0.0
+        self._success_mode = False
+        self._model_name = model_name or self._extract_model(title)
         self._build(title, subtitle)
 
     def hide(self, delay_ms: int = 0) -> None:
@@ -103,18 +103,18 @@ class ModelLoadingOverlay:
         self._stop_anim()
         if self._frame and self._frame.winfo_exists():
             self._frame.destroy()
-        self._frame        = None
-        self._spinner_cv   = None
-        self._prog_cv      = None
-        self._ring_cv      = None
-        self._title_var    = None
-        self._sub_var      = None
-        self._model_var    = None
-        self._stage_var    = None
-        self._hint_var     = None
-        self._prog_var     = None
-        self._pct_lbl      = None
-        self._first_lbl    = None
+        self._frame = None
+        self._spinner_cv = None
+        self._prog_cv = None
+        self._ring_cv = None
+        self._title_var = None
+        self._sub_var = None
+        self._model_var = None
+        self._stage_var = None
+        self._hint_var = None
+        self._prog_var = None
+        self._pct_lbl = None
+        self._first_lbl = None
         self.current_value = 0.0
 
     def update(self, pct: float = None, subtitle: str = "") -> None:
@@ -137,7 +137,7 @@ class ModelLoadingOverlay:
             except Exception:
                 pass
         if self.current_value >= 100.0 and not self._success_mode:
-            self._success_mode  = True
+            self._success_mode = True
             self._success_pulse = 0.0
 
     def set_subtitle(self, text: str) -> None:
@@ -174,7 +174,7 @@ class ModelLoadingOverlay:
         # Хинт — сразу подставить текущий
         if self._hint_var:
             hints = _HINTS_RU if lang == "ru" else _HINTS_EN
-            idx   = self._hint_idx % len(hints)
+            idx = self._hint_idx % len(hints)
             self._hint_var.set(hints[idx])
 
         # Subtitle — перегуманизировать текущий текст
@@ -226,7 +226,7 @@ class ModelLoadingOverlay:
     def _update_stage(self) -> None:
         if not self._stage_var:
             return
-        pct    = self.current_value
+        pct = self.current_value
         stages = _STAGES_RU if self.lang == "ru" else _STAGES_EN
         if pct < 15:
             s = stages[0]
@@ -243,9 +243,9 @@ class ModelLoadingOverlay:
     # ── Build ─────────────────────────────────────────────────────────────
 
     def _build(self, title: str, subtitle: str) -> None:
-        c    = self.colors
+        c = self.colors
         lang = self.lang
-        ru   = (lang == "ru")
+        ru = (lang == "ru")
 
         self._frame = tk.Frame(self.root, bg=c.get("bg", "#0a0c10"))
         self._frame.place(x=0, y=0, relwidth=1, relheight=1)
@@ -340,7 +340,7 @@ class ModelLoadingOverlay:
         self._pct_lbl.pack(side=tk.RIGHT)
 
         self._prog_var = tk.DoubleVar(value=0.0)
-        self._prog_cv  = tk.Canvas(
+        self._prog_cv = tk.Canvas(
             prog_outer, width=320, height=14,
             bg=c.get("card", "#14171c"),
             highlightthickness=0)
@@ -379,12 +379,12 @@ class ModelLoadingOverlay:
     # ── Animation ─────────────────────────────────────────────────────────
 
     def _start_anim(self) -> None:
-        self._angle       = 0.0
-        self._angle2      = 0.0
-        self._pulse       = 0.0
-        self._dots        = 0
-        self._hint_idx    = 0
-        self._hint_fade   = 1.0
+        self._angle = 0.0
+        self._angle2 = 0.0
+        self._pulse = 0.0
+        self._dots = 0
+        self._hint_idx = 0
+        self._hint_fade = 1.0
         self._hint_fading = False
         self._tick()
         self._tick_dots()
@@ -412,9 +412,9 @@ class ModelLoadingOverlay:
             speed2 = 4.0
             self._success_pulse = (self._success_pulse + 0.08) % 1.0
 
-        self._angle  = (self._angle  + speed1) % 360.0
+        self._angle = (self._angle + speed1) % 360.0
         self._angle2 = (self._angle2 - speed2) % 360.0
-        self._pulse  = (self._pulse  + 0.032)  % 1.0
+        self._pulse = (self._pulse + 0.032) % 1.0
 
         try:
             self._draw_spinner()
@@ -436,39 +436,39 @@ class ModelLoadingOverlay:
             ]
             if any(raw.startswith(s) for s in _animated):
                 self._sub_var.set(raw + "." * ((self._dots % 3) + 1))
-        self._dots  += 1
+        self._dots += 1
         self._dot_id = self.root.after(520, self._tick_dots)
 
     def _tick_hint(self) -> None:
         if not (self._frame and self._frame.winfo_exists()):
             return
-        hints          = _HINTS_RU if self.lang == "ru" else _HINTS_EN
+        hints = _HINTS_RU if self.lang == "ru" else _HINTS_EN
         self._hint_idx = (self._hint_idx + 1) % len(hints)
         self._hint_var.set(hints[self._hint_idx])
-        self._hint_id  = self.root.after(4000, self._tick_hint)
+        self._hint_id = self.root.after(4000, self._tick_hint)
 
     # ── Draw spinner ──────────────────────────────────────────────────────
 
     def _draw_spinner(self) -> None:
-        c  = self.colors
+        c = self.colors
         cv = self._spinner_cv
         if not cv:
             return
         cv.delete("all")
 
         cx, cy = 55, 55
-        R1     = 28
-        R2     = 19
+        R1 = 28
+        R2 = 19
 
         accent = c.get("accent",    "#3b82f6")
-        glow   = c.get("glow",      "#1d4ed8")
-        track  = c.get("highlight", "#1e293b")
-        bg     = c.get("card",      "#14171c")
+        glow = c.get("glow",      "#1d4ed8")
+        track = c.get("highlight", "#1e293b")
+        bg = c.get("card",      "#14171c")
 
         if self._success_mode:
-            t      = min(1.0, self._success_pulse * 3)
+            t = min(1.0, self._success_pulse * 3)
             accent = self._blend("#22c55e", accent, t)
-            glow   = self._blend("#16a34a", glow,   t)
+            glow = self._blend("#16a34a", glow,   t)
 
         brightness = 0.7 + self.current_value / 100 * 0.3
 
@@ -478,22 +478,22 @@ class ModelLoadingOverlay:
 
         N1, ARC1 = 20, 210
         for i in range(N1):
-            fade  = i / (N1 - 1)
+            fade = i / (N1 - 1)
             start = (self._angle - ARC1 + i * ARC1 / N1) % 360
-            ext   = ARC1 / N1 + 0.6
-            gc    = self._blend(glow,   bg, 1.0 - fade * 0.65 * brightness)
+            ext = ARC1 / N1 + 0.6
+            gc = self._blend(glow,   bg, 1.0 - fade * 0.65 * brightness)
             self._arc(cv, cx, cy, R1, start, ext, gc,  7)
-            col   = self._blend(accent, bg, 1.0 - fade * 0.88 * brightness)
+            col = self._blend(accent, bg, 1.0 - fade * 0.88 * brightness)
             self._arc(cv, cx, cy, R1, start, ext, col, 3)
 
         N2, ARC2 = 14, 150
         for i in range(N2):
-            fade  = i / (N2 - 1)
+            fade = i / (N2 - 1)
             start = (self._angle2 - ARC2 + i * ARC2 / N2) % 360
-            ext   = ARC2 / N2 + 0.5
-            gc    = self._blend(glow,   bg, 1.0 - fade * 0.55 * brightness)
+            ext = ARC2 / N2 + 0.5
+            gc = self._blend(glow,   bg, 1.0 - fade * 0.55 * brightness)
             self._arc(cv, cx, cy, R2, start, ext, gc,  5)
-            col   = self._blend(accent, bg, 1.0 - fade * 0.85 * brightness)
+            col = self._blend(accent, bg, 1.0 - fade * 0.85 * brightness)
             self._arc(cv, cx, cy, R2, start, ext, col, 2)
 
         ar = math.radians(self._angle)
@@ -527,20 +527,20 @@ class ModelLoadingOverlay:
             return
         cv.delete("all")
 
-        c      = self.colors
+        c = self.colors
         cx, cy = 55, 55
-        R      = 50
-        pct    = self.current_value
+        R = 50
+        pct = self.current_value
 
         accent = c.get("accent",    "#3b82f6")
-        glow   = c.get("glow",      "#1d4ed8")
-        track  = c.get("highlight", "#1e293b")
-        bg     = c.get("card",      "#14171c")
+        glow = c.get("glow",      "#1d4ed8")
+        track = c.get("highlight", "#1e293b")
+        bg = c.get("card",      "#14171c")
 
         if self._success_mode:
-            t      = min(1.0, self._success_pulse * 3)
+            t = min(1.0, self._success_pulse * 3)
             accent = self._blend("#22c55e", accent, t)
-            glow   = self._blend("#16a34a", glow,   t)
+            glow = self._blend("#16a34a", glow,   t)
 
         self._arc(cv, cx, cy, R, 0, 359.9, track, 4)
 
@@ -567,20 +567,20 @@ class ModelLoadingOverlay:
         cv = self._prog_cv
         if not cv:
             return
-        c    = self.colors
-        pct  = self._prog_var.get() if self._prog_var else 0.0
+        c = self.colors
+        pct = self._prog_var.get() if self._prog_var else 0.0
         W, H = 320, 14
-        r    = H // 2
+        r = H // 2
 
         cv.delete("all")
 
-        bg_col   = c.get("highlight", "#1e293b")
+        bg_col = c.get("highlight", "#1e293b")
         fill_col = c.get("accent",    "#3b82f6")
         glow_col = c.get("glow",      "#1d4ed8")
         card_col = c.get("card",      "#14171c")
 
         if self._success_mode:
-            t        = min(1.0, self._success_pulse * 3)
+            t = min(1.0, self._success_pulse * 3)
             fill_col = self._blend("#22c55e", fill_col, t)
             glow_col = self._blend("#16a34a", glow_col, t)
 
@@ -590,7 +590,7 @@ class ModelLoadingOverlay:
         if fill_w >= r * 2:
             for i in range(5, 0, -1):
                 glow_i = max(0, i - 2)
-                gc     = self._blend(glow_col, card_col, 1.0 - i / 5 * 0.55)
+                gc = self._blend(glow_col, card_col, 1.0 - i / 5 * 0.55)
                 self._rr(cv, 0, -glow_i, fill_w, H + glow_i, r, gc)
 
             self._rr(cv, 0, 0, fill_w, H, r, fill_col)
@@ -599,15 +599,15 @@ class ModelLoadingOverlay:
             self._rr(cv, 2, 1, fill_w - 2, H // 2 + 1, r - 1, shine)
 
             t_pos = (math.sin(self._pulse * math.pi * 2) + 1) / 2
-            bx    = int(r + (fill_w - r * 2) * t_pos)
-            bw    = 28
-            left  = bx - bw // 2
+            bx = int(r + (fill_w - r * 2) * t_pos)
+            bw = 28
+            left = bx - bw // 2
             right = bx + bw // 2
 
             if left > r and right < fill_w - r:
                 ph_center = self._lighter(fill_col, 0.40)
-                ph_edge   = self._lighter(fill_col, 0.15)
-                mid       = bw // 3
+                ph_edge = self._lighter(fill_col, 0.15)
+                mid = bw // 3
                 cv.create_rectangle(
                     left,        2, left + mid,  H - 2,
                     fill=ph_edge,   outline="")

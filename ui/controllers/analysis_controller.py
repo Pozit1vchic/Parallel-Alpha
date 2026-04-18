@@ -267,6 +267,7 @@ class AnalysisController:
                     0, lambda: self.on_progress(pct, status))
 
             def _on_result(result: "AnalysisResult") -> None:
+                print(f"[Controller] _on_result вызван, matches={len(result.matches)}")
                 matches = result.matches or []
 
                 # Фильтр ДО матчинга уже применён в _run_analysis
