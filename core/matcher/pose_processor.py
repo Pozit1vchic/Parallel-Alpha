@@ -2,21 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 core/matcher/pose_processor.py
-v16 — Refactored for maximum accuracy and performance.
+v17 — Appearance-aware pose processing with body proportions.
 
-Ключевые изменения v16:
-- MIN_VISIBLE_KPS снижен с 8 до 6 для частично видимых людей
-- Добавлены геометрические проверки bbox (area, aspect ratio)
-- mirror_pose_with_meta() теперь инвертирует direction (left↔right)
-- Оптимизирована векторизация через np.einsum
-- Добавлены docstring для scale и anchor_y
-- Улучшен fallback для anchor-точек
+Критические улучшения v13:
+1. Добавлен compute_body_proportions() — эмбеддинг пропорций тела
+2. Добавлен compare_body_proportions() — сравнение внешности людей
+3. build_poses_tensor() сохраняет body_proportions в метаданные
+4. Улучшена валидация: отсев нечеловеческих поз
+5. Добавлена проверка симметричности тела (human-likeness)
+6. MIN_VISIBLE_KPS = 7 (баланс между recall и precision)
+7. Добавлен fallback для лиц без anchor-точек
 
-Параметры:
-- MIN_VISIBLE_KPS = 6 (было 8)
-- MIN_KP_CONFIDENCE = 0.22 (было 0.28)
-- MIN_ANCHOR_CONFIDENCE = 0.25 (было 0.31)
-- Bbox фильтры: area [400, 600000], aspect [0.2, 5.0]
+Цель: разделять разных людей, даже если позы похожи.
 """
 
 from __future__ import annotations
@@ -25,17 +22,14 @@ from typing import TypeAlias, Optional
 import numpy as np
 import torch
 
-# ── Типы ──────────────────────────────────────────────────────────────────────
 PoseDict: TypeAlias = dict
 
 # ── Константы COCO-17 ─────────────────────────────────────────────────────────
 COCO_N_KPS = 17
 
-# Опорные точки: плечи (5,6) + бёдра (11,12)
 ANCHOR_KPS: list[int] = [5, 6, 11, 12]
 ANCHOR_KPS_ARR = np.array(ANCHOR_KPS, dtype=np.intp)
 
-# Парные точки для зеркального отражения
 MIRROR_PAIRS: list[tuple[int, int]] = [
     (1, 2), (3, 4),
     (5, 6), (7, 8), (9, 10),
@@ -45,16 +39,19 @@ MIRROR_PAIRS: list[tuple[int, int]] = [
 _PAIRED_INDICES: frozenset[int] = frozenset(i for pair in MIRROR_PAIRS for i in pair)
 _UNPAIRED_INDICES: list[int] = [i for i in range(COCO_N_KPS) if i not in _PAIRED_INDICES]
 
+# ── Индексы частей тела ───────────────────────────────────────────────────────
+NOSE = 0
+EYE_L, EYE_R = 1, 2
+EAR_L, EAR_R = 3, 4
+SHOULDER_L, SHOULDER_R = 5, 6
+ELBOW_L, ELBOW_R = 7, 8
+WRIST_L, WRIST_R = 9, 10
+HIP_L, HIP_R = 11, 12
+KNEE_L, KNEE_R = 13, 14
+ANKLE_L, ANKLE_R = 15, 16
+
 # ── Предвычисленные индексы для mirror_vectors ────────────────────────────────
 def _build_mirror_indices() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Строит предвычисленные индексы для быстрого зеркального отражения поз.
-    
-    Возвращает:
-        src_x: индексы для X-координат (с заменой пар)
-        sign_x: знаки для X-координат (-1 для инверсии)
-        src_y: индексы для Y-координат (с заменой пар)
-    """
     n = COCO_N_KPS * 2
     src_x = np.arange(n, dtype=np.int64)
     sign_x = np.ones(n, dtype=np.float32)
@@ -86,7 +83,6 @@ _MIRROR_SRC_Y_T: torch.Tensor | None = None
 _MIRROR_DEVICE: str = ""
 
 def _get_mirror_tensors(device: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Ленивая инициализация тензоров для mirror_vectors на указанном устройстве."""
     global _MIRROR_SRC_X_T, _MIRROR_SIGN_X_T, _MIRROR_SRC_Y_T, _MIRROR_DEVICE
     if _MIRROR_SRC_X_T is None or _MIRROR_DEVICE != device:
         _MIRROR_SRC_X_T = torch.from_numpy(_MIRROR_SRC_X).to(device)
@@ -95,37 +91,35 @@ def _get_mirror_tensors(device: str) -> tuple[torch.Tensor, torch.Tensor, torch.
         _MIRROR_DEVICE = device
     return _MIRROR_SRC_X_T, _MIRROR_SIGN_X_T, _MIRROR_SRC_Y_T
 
-# ── Веса частей тела (оптимизированные для точности) ──────────────────────────
+# ── Веса частей тела ──────────────────────────────────────────────────────────
 BODY_WEIGHTS = np.array([
-    0.9,  # 0 нос
-    0.5, 0.5,  # 1,2 глаза
-    0.4, 0.4,  # 3,4 уши
-    1.8, 1.8,  # 5,6 плечи ★ (ключевые)
-    1.4, 1.4,  # 7,8 локти
-    1.1, 1.1,  # 9,10 кисти
-    1.8, 1.8,  # 11,12 бёдра ★ (ключевые)
-    1.5, 1.5,  # 13,14 колени
-    1.1, 1.1,  # 15,16 стопы
+    0.9,
+    0.5, 0.5,
+    0.4, 0.4,
+    1.8, 1.8,
+    1.4, 1.4,
+    1.1, 1.1,
+    1.8, 1.8,
+    1.5, 1.5,
+    1.1, 1.1,
 ], dtype=np.float32)
 
 BODY_WEIGHTS_2D: np.ndarray = BODY_WEIGHTS[:, np.newaxis]
 
-# ── Пороги (снижены для повышения recall) ─────────────────────────────────────
-MIN_KP_CONFIDENCE = 0.22       # Снижено с 0.28 для частично видимых
-MIN_ANCHOR_CONFIDENCE = 0.25   # Снижено с 0.31
+# ── Пороги (баланс precision/recall) ──────────────────────────────────────────
+MIN_KP_CONFIDENCE = 0.24
+MIN_ANCHOR_CONFIDENCE = 0.27
 ANCHOR_CONF_KPS = [5, 6, 11, 12, 13, 14]
 ANCHOR_CONF_KPS_ARR = np.array(ANCHOR_CONF_KPS, dtype=np.intp)
 
-_MIN_VISIBLE_KPS = 6           # Снижено с 8
-_MIN_VISIBLE_ANCHORS = 2       # Оставлено 2
+_MIN_VISIBLE_KPS = 7
+_MIN_VISIBLE_ANCHORS = 2
 
-# ── Bbox фильтры (геометрические проверки) ────────────────────────────────────
-MIN_BBOX_AREA = 400            # Минимальная площадь bbox
-MAX_BBOX_AREA = 600000         # Максимальная площадь
-MIN_BBOX_ASPECT = 0.2          # Минимальный aspect ratio
-MAX_BBOX_ASPECT = 5.0          # Максимальный aspect ratio
+MIN_BBOX_AREA = 500
+MAX_BBOX_AREA = 500000
+MIN_BBOX_ASPECT = 0.25
+MAX_BBOX_ASPECT = 4.5
 
-# ── Маппинг направлений для зеркалирования ────────────────────────────────────
 DIRECTION_MIRROR_MAP = {
     "left": "right",
     "right": "left",
@@ -136,45 +130,188 @@ DIRECTION_MIRROR_MAP = {
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# § 1. ВАЛИДАЦИЯ (улучшенная с геометрическими проверками)
+# § НОВОЕ: Пропорции тела (Appearance Embedding)
+# ═══════════════════════════════════════════════════════════════════════════════
+def compute_body_proportions(kps: np.ndarray, conf_threshold: float = MIN_KP_CONFIDENCE) -> dict:
+    """
+    Вычисляет пропорции тела человека для идентификации.
+    
+    Признаки:
+    - leg_to_torso: длина ног / длина торса
+    - shoulder_to_height: ширина плеч / полный рост
+    - torso_aspect: ширина плеч / длина торса
+    - arm_to_torso: длина рук / длина торса
+    
+    Args:
+        kps: Keypoints (17, 2) или (17, 3)
+        conf_threshold: Порог уверенности
+        
+    Returns:
+        dict с пропорциями и флагом valid
+    """
+    xy = kps[:, :2] if kps.shape[1] >= 2 else kps
+    conf = kps[:, 2] if kps.shape[1] >= 3 else np.ones(len(kps))
+    
+    vis = conf >= conf_threshold
+    
+    props = {
+        "leg_to_torso": 1.0,
+        "shoulder_to_height": 0.3,
+        "torso_aspect": 0.5,
+        "arm_to_torso": 0.8,
+        "valid": False,
+    }
+    
+    if not (vis[SHOULDER_L] and vis[SHOULDER_R] and vis[HIP_L] and vis[HIP_R]):
+        return props
+    
+    shoulder_center = (xy[SHOULDER_L] + xy[SHOULDER_R]) / 2
+    hip_center = (xy[HIP_L] + xy[HIP_R]) / 2
+    torso_length = np.linalg.norm(hip_center - shoulder_center)
+    
+    if torso_length < 1e-3:
+        return props
+    
+    # Длина ног
+    leg_length = 0.0
+    n_legs = 0
+    for hip_idx, knee_idx, ankle_idx in [(HIP_L, KNEE_L, ANKLE_L), (HIP_R, KNEE_R, ANKLE_R)]:
+        if vis[hip_idx] and vis[knee_idx] and vis[ankle_idx]:
+            thigh = np.linalg.norm(xy[knee_idx] - xy[hip_idx])
+            shin = np.linalg.norm(xy[ankle_idx] - xy[knee_idx])
+            leg_length += (thigh + shin)
+            n_legs += 1
+    
+    if n_legs > 0:
+        leg_length /= n_legs
+        props["leg_to_torso"] = leg_length / torso_length
+    
+    # Ширина плеч
+    shoulder_width = np.linalg.norm(xy[SHOULDER_R] - xy[SHOULDER_L])
+    props["torso_aspect"] = shoulder_width / torso_length
+    
+    # Полный рост
+    if vis[NOSE]:
+        height = np.linalg.norm(xy[NOSE] - hip_center) + leg_length
+        if height > 1e-3:
+            props["shoulder_to_height"] = shoulder_width / height
+    
+    # Длина рук
+    arm_length = 0.0
+    n_arms = 0
+    for shoulder_idx, elbow_idx, wrist_idx in [(SHOULDER_L, ELBOW_L, WRIST_L), (SHOULDER_R, ELBOW_R, WRIST_R)]:
+        if vis[shoulder_idx] and vis[elbow_idx] and vis[wrist_idx]:
+            upper = np.linalg.norm(xy[elbow_idx] - xy[shoulder_idx])
+            lower = np.linalg.norm(xy[wrist_idx] - xy[elbow_idx])
+            arm_length += (upper + lower)
+            n_arms += 1
+    
+    if n_arms > 0:
+        arm_length /= n_arms
+        props["arm_to_torso"] = arm_length / torso_length
+    
+    props["valid"] = True
+    return props
+
+
+def compare_body_proportions(props1: dict, props2: dict) -> float:
+    """
+    Сравнивает пропорции тела двух людей.
+    
+    Returns:
+        float: similarity (0..1), где 1 = одинаковые пропорции
+    """
+    if not props1.get("valid") or not props2.get("valid"):
+        return 0.5
+    
+    keys = ["leg_to_torso", "shoulder_to_height", "torso_aspect", "arm_to_torso"]
+    diffs = []
+    
+    for key in keys:
+        v1, v2 = props1.get(key, 1.0), props2.get(key, 1.0)
+        if max(v1, v2) < 1e-5:
+            continue
+        rel_diff = abs(v1 - v2) / max(v1, v2)
+        diffs.append(rel_diff)
+    
+    if not diffs:
+        return 0.5
+    
+    avg_diff = sum(diffs) / len(diffs)
+    similarity = max(0.0, 1.0 - avg_diff * 3.0)
+    return similarity
+
+
+def is_human_like(kps: np.ndarray, conf_threshold: float = MIN_KP_CONFIDENCE) -> bool:
+    """
+    Проверяет, похож ли скелет на человека (не животное, не объект).
+    
+    Критерии:
+    1. Симметричность парных точек
+    2. Разумные пропорции тела
+    3. Вертикальная ориентация
+    """
+    xy = kps[:, :2] if kps.shape[1] >= 2 else kps
+    conf = kps[:, 2] if kps.shape[1] >= 3 else np.ones(len(kps))
+    vis = conf >= conf_threshold
+    
+    # Проверка симметричности
+    symmetry_score = 0.0
+    n_pairs = 0
+    
+    for l_idx, r_idx in MIRROR_PAIRS:
+        if vis[l_idx] and vis[r_idx]:
+            # Y-координаты должны быть близки
+            y_diff = abs(xy[l_idx, 1] - xy[r_idx, 1])
+            x_dist = abs(xy[l_idx, 0] - xy[r_idx, 0])
+            if x_dist > 1e-3:
+                symmetry_score += min(1.0, y_diff / x_dist)
+                n_pairs += 1
+    
+    if n_pairs > 0:
+        avg_asymmetry = symmetry_score / n_pairs
+        if avg_asymmetry > 0.5:
+            return False
+    
+    # Проверка вертикальности
+    if vis[NOSE] and (vis[HIP_L] or vis[HIP_R]):
+        hip_y = xy[HIP_L, 1] if vis[HIP_L] else xy[HIP_R, 1]
+        nose_y = xy[NOSE, 1]
+        if nose_y >= hip_y:
+            return False
+    
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § ВАЛИДАЦИЯ (улучшенная)
 # ═══════════════════════════════════════════════════════════════════════════════
 def is_pose_valid(pose_data: PoseDict) -> bool:
     """
-    Проверяет валидность позы по множеству критериев.
+    Проверяет валидность позы.
     
-    Критерии валидации:
-    1. Наличие keypoints
-    2. Bbox геометрические проверки (area, aspect ratio)
-    3. Минимальное количество видимых keypoints (>= 6)
-    4. Средняя уверенность видимых keypoints
-    5. Минимальное количество видимых anchor-точек (>= 2)
-    
-    Args:
-        pose_data: Словарь с ключами 'keypoints' и опционально 'bbox'
-        
-    Returns:
-        bool: True если поза валидна
+    Критерии:
+    1. Bbox геометрия
+    2. Минимум видимых keypoints
+    3. Минимум anchor-точек
+    4. Похожесть на человека
     """
     kps = pose_data.get("keypoints")
     if kps is None:
         return False
 
-    # ── Проверка bbox (геометрические фильтры) ─────────────────────────────────
     bbox = pose_data.get("bbox")
     if bbox and len(bbox) == 4:
         x1, y1, x2, y2 = bbox
         area = (x2 - x1) * (y2 - y1)
         
-        # Фильтр по площади
         if area < MIN_BBOX_AREA or area > MAX_BBOX_AREA:
             return False
         
-        # Фильтр по aspect ratio
         aspect = (x2 - x1) / max(y2 - y1, 1)
         if aspect < MIN_BBOX_ASPECT or aspect > MAX_BBOX_ASPECT:
             return False
 
-    # ── Проверка уверенности keypoints ────────────────────────────────────────
     conf = kps[:COCO_N_KPS, 2].astype(np.float32, copy=False)
     if len(conf) < COCO_N_KPS:
         return False
@@ -182,47 +319,30 @@ def is_pose_valid(pose_data: PoseDict) -> bool:
     vis_mask = conf >= MIN_KP_CONFIDENCE
     n_visible = int(np.count_nonzero(vis_mask))
     
-    # Минимальное количество видимых keypoints
     if n_visible < _MIN_VISIBLE_KPS:
         return False
 
-    # Средняя уверенность видимых keypoints
     if float(conf[vis_mask].sum()) / n_visible < MIN_KP_CONFIDENCE:
         return False
 
-    # ── Проверка anchor-точек ─────────────────────────────────────────────────
     n_anchor = int(np.count_nonzero(conf[ANCHOR_CONF_KPS_ARR] >= MIN_ANCHOR_CONFIDENCE))
     if n_anchor < _MIN_VISIBLE_ANCHORS:
+        return False
+
+    if not is_human_like(kps, MIN_KP_CONFIDENCE):
         return False
 
     return True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# § 2. НОРМАЛИЗАЦИЯ ОДНОЙ ПОЗЫ (оптимизированная)
+# § НОРМАЛИЗАЦИЯ
 # ═══════════════════════════════════════════════════════════════════════════════
 def preprocess_pose(pose_data: PoseDict, use_body_weights: bool = True) -> np.ndarray:
-    """
-    Нормализует одну позу: центрирование, взвешивание, L2-нормализация.
-    
-    Алгоритм:
-    1. Вычисляет центр (anchor) по плечам и бёдрам
-    2. Центрирует keypoints относительно anchor
-    3. Применяет веса частей тела (если use_body_weights=True)
-    4. L2-нормализует результат
-    
-    Args:
-        pose_data: Словарь с ключом 'keypoints'
-        use_body_weights: Применять ли веса частей тела
-        
-    Returns:
-        np.ndarray: Нормализованный вектор позы (34 элемента)
-    """
     kps = pose_data["keypoints"][:COCO_N_KPS]
     xy = kps[:, :2].astype(np.float32, copy=False)
     conf = kps[:, 2].astype(np.float32, copy=False)
 
-    # ── Вычисление anchor-точки ───────────────────────────────────────────────
     anc_conf = conf[ANCHOR_KPS_ARR]
     vis_anc = anc_conf >= MIN_KP_CONFIDENCE
 
@@ -232,7 +352,6 @@ def preprocess_pose(pose_data: PoseDict, use_body_weights: bool = True) -> np.nd
         weight_sum = vis_f.sum()
         anchor_xy = (vis_f @ anc_xy) / weight_sum
     else:
-        # Fallback: используем все видимые keypoints
         vis_all = conf >= MIN_KP_CONFIDENCE
         n_vis = int(np.count_nonzero(vis_all))
         if n_vis > 0:
@@ -241,46 +360,27 @@ def preprocess_pose(pose_data: PoseDict, use_body_weights: bool = True) -> np.nd
         else:
             anchor_xy = xy.mean(axis=0)
 
-    # ── Центрирование и взвешивание ───────────────────────────────────────────
     centered = xy - anchor_xy
     if use_body_weights:
         centered = centered * BODY_WEIGHTS_2D
 
-    # ── L2-нормализация ───────────────────────────────────────────────────────
     flat = centered.ravel()
     norm_sq = float(np.dot(flat, flat))
     norm = (norm_sq ** 0.5) + 1e-5
     return (flat / norm).astype(np.float32)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# § 3. БАТЧ-НОРМАЛИЗАЦИЯ (оптимизированная)
-# ═══════════════════════════════════════════════════════════════════════════════
 def batch_preprocess_poses(kps_batch: np.ndarray, use_body_weights: bool = True) -> np.ndarray:
-    """
-    Векторизованная батч-нормализация поз.
-    
-    Использует np.einsum для эффективного вычисления взвешенных сумм.
-    
-    Args:
-        kps_batch: Массив поз形状 (N, 17, 3)
-        use_body_weights: Применять ли веса частей тела
-        
-    Returns:
-        np.ndarray: Нормализованные векторы形状 (N, 34)
-    """
     M = kps_batch.shape[0]
     xy = kps_batch[:, :COCO_N_KPS, :2].astype(np.float32)
     conf = kps_batch[:, :COCO_N_KPS, 2].astype(np.float32)
 
-    # ── Вычисление anchor для каждой позы ─────────────────────────────────────
     anc_conf = conf[:, ANCHOR_KPS_ARR]
     anc_vis = (anc_conf >= MIN_KP_CONFIDENCE).astype(np.float32)
     anc_count = anc_vis.sum(axis=1, keepdims=True)
     anc_xy = xy[:, ANCHOR_KPS_ARR, :]
     num = np.einsum("mi,mij->mj", anc_vis, anc_xy)
 
-    # ── Fallback для поз без достаточного количества anchor ───────────────────
     no_anchor = (anc_count[:, 0] < _MIN_VISIBLE_ANCHORS)
     if no_anchor.any():
         all_vis = (conf >= MIN_KP_CONFIDENCE).astype(np.float32)
@@ -297,31 +397,12 @@ def batch_preprocess_poses(kps_batch: np.ndarray, use_body_weights: bool = True)
     if use_body_weights:
         centered = centered * BODY_WEIGHTS_2D[np.newaxis, :, :]
 
-    # ── L2-нормализация ───────────────────────────────────────────────────────
     flat = centered.reshape(M, 34)
     norms = np.sqrt(np.einsum("ij,ij->i", flat, flat)) + 1e-5
     return (flat / norms[:, np.newaxis]).astype(np.float32)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# § 4. ВЫЧИСЛЕНИЕ ПРИЗНАКОВ (scale, anchor_y)
-# ═══════════════════════════════════════════════════════════════════════════════
 def compute_pose_features(kps_xy: np.ndarray) -> tuple[float, float]:
-    """
-    Вычисляет геометрические признаки позы.
-    
-    Args:
-        kps_xy: Keypoints形状 (17, 2)
-        
-    Returns:
-        tuple[float, float]: (scale, anchor_y)
-            - scale: Максимальное отклонение от центра (размер позы)
-            - anchor_y: Y-координата центра позы (высота в кадре)
-    
-    Примечание:
-        scale используется для штрафа за различие в размерах поз.
-        anchor_y используется для штрафа за различие в высоте положения.
-    """
     anc = kps_xy[ANCHOR_KPS_ARR]
     anchor_xy = anc.mean(axis=0)
     centered = kps_xy - anchor_xy
@@ -331,19 +412,9 @@ def compute_pose_features(kps_xy: np.ndarray) -> tuple[float, float]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# § 5. ЗЕРКАЛЬНОЕ ОТРАЖЕНИЕ
+# § ЗЕРКАЛЬНОЕ ОТРАЖЕНИЕ
 # ═══════════════════════════════════════════════════════════════════════════════
 def mirror_vectors(vec: torch.Tensor, conf: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """
-    Зеркально отражает векторы поз по вертикальной оси.
-    
-    Args:
-        vec: Тензор векторов поз形状 (N, 34)
-        conf: Опционально, уверенность keypoints для маскирования
-        
-    Returns:
-        torch.Tensor: Отражённые векторы
-    """
     device = str(vec.device)
     src_x, sign_x, src_y = _get_mirror_tensors(device)
 
@@ -364,38 +435,21 @@ def mirror_vectors(vec: torch.Tensor, conf: Optional[torch.Tensor] = None) -> to
 
 
 def mirror_pose_with_meta(pose: np.ndarray, meta: dict) -> tuple[np.ndarray, dict]:
-    """
-    Зеркально отражает позу и обновляет метаданные.
-    
-    Критическое исправление: инвертирует направление (left↔right).
-    
-    Args:
-        pose: Вектор позы или keypoints
-        meta: Метаданные с ключом 'dir'
-        
-    Returns:
-        tuple[np.ndarray, dict]: (отражённая поза, обновлённые метаданные)
-    """
-    # Отражаем вектор
     if isinstance(pose, np.ndarray):
         if pose.ndim == 1:
-            # Вектор (34,) — используем torch для отражения
             pose_t = torch.from_numpy(pose).unsqueeze(0)
             mirrored_t = mirror_vectors(pose_t)
             mirrored_vec = mirrored_t.squeeze(0).numpy()
         else:
-            # Keypoints (17, 3) — отражаем X-координаты
             mirrored_vec = pose.copy()
             for l_idx, r_idx in MIRROR_PAIRS:
                 mirrored_vec[l_idx, 0] = pose[r_idx, 0]
                 mirrored_vec[r_idx, 0] = pose[l_idx, 0]
-            # Инвертируем X относительно центра
             center_x = pose[:, 0].mean()
             mirrored_vec[:, 0] = 2 * center_x - mirrored_vec[:, 0]
     else:
         mirrored_vec = pose
 
-    # Инвертируем направление
     dir_map = DIRECTION_MIRROR_MAP
     original_dir = meta.get("dir", "unknown")
     meta["dir"] = dir_map.get(original_dir, original_dir)
@@ -405,28 +459,12 @@ def mirror_pose_with_meta(pose: np.ndarray, meta: dict) -> tuple[np.ndarray, dic
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# § 6. СБОРКА ТЕНЗОРА (улучшенная)
+# § СБОРКА ТЕНЗОРА (с пропорциями тела)
 # ═══════════════════════════════════════════════════════════════════════════════
 def build_poses_tensor(
     frames_data: list[dict],
     use_body_weights: bool = True,
 ) -> tuple[torch.Tensor | None, list[dict]]:
-    """
-    Собирает тензор поз из данных кадров.
-    
-    Для каждой позы вычисляет:
-    - Нормализованный вектор (34 элемента)
-    - scale: размер позы (для штрафа за различие масштабов)
-    - anchor_y: высота центра позы (для штрафа за различие положения)
-    - dir: направление движения (left/right/forward/back)
-    
-    Args:
-        frames_data: Список кадров с позами
-        use_body_weights: Применять ли веса частей тела
-        
-    Returns:
-        tuple[torch.Tensor | None, list[dict]]: (тензор поз, метаданные)
-    """
     selected_kps: list[np.ndarray] = []
     selected_meta: list[dict] = []
 
@@ -488,11 +526,9 @@ def build_poses_tensor(
     if not selected_kps:
         return None, []
 
-    # ── Векторизованная нормализация ──────────────────────────────────────────
     kps_batch = np.stack(selected_kps, axis=0)
     vectors = batch_preprocess_poses(kps_batch, use_body_weights)
 
-    # ── Вычисление scale и anchor_y для каждой позы ───────────────────────────
     xy_batch = kps_batch[:, :, :2]
     anc_batch = xy_batch[:, ANCHOR_KPS_ARR, :]
     anchor_xy_b = anc_batch.mean(axis=1)
@@ -503,6 +539,7 @@ def build_poses_tensor(
     for i, m in enumerate(selected_meta):
         m["scale"] = float(scales[i])
         m["anchor_y"] = float(anchor_ys[i])
+        m["body_proportions"] = compute_body_proportions(kps_batch[i])
 
     tensor = torch.from_numpy(vectors)
     return tensor, selected_meta

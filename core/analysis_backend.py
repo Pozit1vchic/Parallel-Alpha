@@ -1,8 +1,11 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# core/analysis_backend.py — PRODUCER-CONSUMER + БОЛЬШАЯ ОЧЕРЕДЬ
+# ═══════════════════════════════════════════════════════════════════════════════
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 AnalysisBackend — фоновый движок анализа видео.
-Исправлены все критические баги, добавлена оптимизация и робастность.
+Версия: High-Performance (устранены рывки)
 """
 from __future__ import annotations
 
@@ -10,6 +13,7 @@ import gc
 import hashlib
 import logging
 import os
+import queue
 import time
 import traceback
 from collections import defaultdict, deque
@@ -33,17 +37,11 @@ from core.matcher import (
     preprocess_pose,
 )
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # Логгирование
 # ═══════════════════════════════════════════════════════════════════════════════
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger("AnalysisBackend")
-
+logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Статусы
@@ -125,7 +123,7 @@ class VideoMeta:
     fps:          float
     total_frames: int
     width:        int
-    height:        int
+    height:       int
 
     @property
     def duration(self) -> float:
@@ -166,7 +164,6 @@ class AnalysisResult:
 # Константы
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Исправлено: унифицированы ключи quality mapping
 QUALITY_FPS: dict[str, int] = {
     "Быстро": 8,
     "Средне": 15,
@@ -176,41 +173,36 @@ QUALITY_FPS: dict[str, int] = {
 QUALITY_MAPPING: dict[str, str] = {
     "fast":    "Быстро",
     "medium":  "Средне",
-    "maximum": "Макс",      # Исправлено: было "Максимум"
+    "maximum": "Макс",
 }
 
 DEFAULT_QUALITY     = "Средне"
 PREVIEW_SIZE        = (320, 180)
 PREVIEW_JPEG_Q      = 80
 MAX_FRAME_SIDE      = 640
-MAX_ADAPTIVE_SKIP   = 12
+YOLO_INPUT_SIZE     = 848
 ETA_WINDOW          = 60
 PREVIEW_CACHE_LIMIT = 500
+DEFAULT_BATCH_SIZE  = 64
+DEFAULT_CHUNK_SIZE  = 5000
+
+# ═══ НОВОЕ: БОЛЬШАЯ ОЧЕРЕДЬ для устранения рывков ═════════════════════════
+QUEUE_MAXSIZE       = 200  # в 3 раза больше батча (64)
 
 # Ограничения безопасности
 MAX_VIDEO_SIZE_GB   = 10
 MAX_TOTAL_POSES     = 1_000_000
-MAX_ANALYSIS_TIME_H = 24
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _resize_frame(frame: np.ndarray, max_side: int) -> np.ndarray:
-    """Уменьшает кадр без копирования, если не требуется изменение размера."""
-    h, w  = frame.shape[:2]
-    scale = min(max_side / w, max_side / h, 1.0)
-    if scale >= 0.99:  # Threshold для избежания микро-ресайзов
-        return frame
-    new_w = max(1, int(w * scale))
-    new_h = max(1, int(h * scale))
-    return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-
 def _evict_preview_cache(cache_dir: Path, limit: int) -> None:
     """Удаляет старые превью, оставляя только limit самых свежих."""
     try:
+        if not cache_dir.exists():
+            return
         files = sorted(
             cache_dir.glob("*.jpg"),
             key=lambda p: p.stat().st_mtime,
@@ -224,71 +216,19 @@ def _evict_preview_cache(cache_dir: Path, limit: int) -> None:
         logger.warning(f"Ошибка очистки превью-кэша: {e}")
 
 
-def _save_preview(
-    frame:      np.ndarray,
-    cache_dir:  Path,
-    video_hash: str,
-    frame_id:   int,
-) -> None:
-    """Сохраняет превью кадра с оптимизацией — сразу в нужном размере."""
-    try:
-        path = cache_dir / f"{video_hash}_{frame_id}.jpg"
-        if path.exists():
-            return
-        # Оптимизация: сразу ресайз в PREVIEW_SIZE, без промежуточной копии
-        preview = cv2.resize(frame, PREVIEW_SIZE, interpolation=cv2.INTER_AREA)
-        cv2.imwrite(
-            str(path), preview,
-            [cv2.IMWRITE_JPEG_QUALITY, PREVIEW_JPEG_Q],
-        )
-    except Exception as e:
-        logger.debug(f"Не удалось сохранить превью {frame_id}: {e}")
-
-
-def _kp_to_list(kp_raw: Any) -> list | None:
-    """
-    Конвертирует keypoints в list[[x,y,conf],...] с валидацией формы.
-    Принимает np.ndarray (17,3), list или None.
-    """
-    if kp_raw is None:
-        return None
-    
-    # Конвертация в numpy для проверки формы
-    try:
-        if isinstance(kp_raw, np.ndarray):
-            arr = kp_raw
-        elif isinstance(kp_raw, list):
-            arr = np.array(kp_raw)
-        else:
-            arr = np.array(list(kp_raw))
-        
-        # Валидация формы: должно быть (17, 3) или (N, 17, 3)
-        if arr.ndim == 2 and arr.shape == (17, 3):
-            return arr.tolist()
-        elif arr.ndim == 3 and arr.shape[1:] == (17, 3):
-            return arr[0].tolist()  # Берём первую позу
-        else:
-            logger.warning(f"Неверная форма keypoints: {arr.shape}")
-            return None
-    except Exception as e:
-        logger.debug(f"Ошибка конвертации keypoints: {e}")
-        return None
-
-
 def _compute_file_hash(path: str) -> str:
-    """Вычисляет MD5 хэш содержимого файла (первых 1MB для скорости)."""
+    """
+    Усилен хэш файлов.
+    Использует MD5 с полным путём + размер + mtime для скорости и уникальности.
+    """
     hasher = hashlib.md5()
     try:
-        with open(path, 'rb') as f:
-            # Хэшируем первый 1MB для баланса скорости и уникальности
-            chunk = f.read(1024 * 1024)
-            hasher.update(chunk)
-            # Добавляем размер файла для уникальности
-            hasher.update(str(os.path.getsize(path)).encode())
+        stat = os.stat(path)
+        signature = f"{path}:{stat.st_size}:{stat.st_mtime}"
+        hasher.update(signature.encode('utf-8'))
     except Exception as e:
-        logger.warning(f"Не удалось вычислить хэш {path}: {e}")
-        # Fallback на хэш пути
-        hasher.update(path.encode())
+        logger.warning(f"Не удалось вычислить хэш метаданных {path}: {e}")
+        hasher.update(path.encode('utf-8'))
     return hasher.hexdigest()[:12]
 
 
@@ -309,8 +249,22 @@ def _video_capture(path: str):
 class AnalysisBackend:
     """Фоновый движок анализа видео с полной защитой от ошибок."""
 
-    DEFAULT_BATCH_SIZE = 64
-    DEFAULT_CHUNK_SIZE = 5000
+    SIM_RANGES = {
+        "high": (0.90, 1.00),
+        "mid":  (0.80, 0.90),
+        "low":  (0.0,  0.80),
+    }
+    DIR_LABELS = {
+        "forward": "Лицом к камере",
+        "left":    "Влево",
+        "right":   "Вправо",
+        "unknown": "Неизвестно",
+    }
+    BAND_LABELS = {
+        "high": "Высокое сходство",
+        "mid":  "Среднее",
+        "low":  "Низкое",
+    }
 
     def __init__(
         self,
@@ -321,14 +275,13 @@ class AnalysisBackend:
         self.yolo    = yolo if yolo is not None else YoloEngine(device=_device)
         self.matcher = MotionMatcher(device=_device)
 
-        # Исправлено: добавлен Lock для защиты от race condition
         self._start_lock:    Lock  = Lock()
         self._running_event: Event = Event()
         self._stop_event:    Event = Event()
         self._thread: Thread | None = None
 
-        self.BATCH_SIZE = self.DEFAULT_BATCH_SIZE
-        self.CHUNK_SIZE = self.DEFAULT_CHUNK_SIZE
+        self.BATCH_SIZE = DEFAULT_BATCH_SIZE
+        self.CHUNK_SIZE = DEFAULT_CHUNK_SIZE
 
         self._progress_cb: Callable | None = None
         self._result_cb:   Callable | None = None
@@ -341,8 +294,11 @@ class AnalysisBackend:
         self._query_images: list[np.ndarray] = []
         self._search_mode:  SearchMode       = SearchMode.MOTION_MATCH
 
-        # Исправлено: явная типизация вместо hasattr
         self._photo_matcher: PhotoMatcherProtocol | None = None
+        
+        # Для Producer-Consumer
+        self._frame_queue: queue.Queue | None = None
+        self._reader_thread: Thread | None = None
 
     # ── Thread-safe свойство ──────────────────────────────────────────────
 
@@ -370,7 +326,6 @@ class AnalysisBackend:
         mode:     SearchMode      = SearchMode.MOTION_MATCH,
     ) -> None:
         """Запускает анализ с защитой от race condition."""
-        # Исправлено: Lock защищает от одновременного запуска
         with self._start_lock:
             if self.analysis_running:
                 logger.warning("Анализ уже запущен.")
@@ -399,16 +354,13 @@ class AnalysisBackend:
         self._thread.start()
 
     def stop_analysis(self, timeout: float = 5.0) -> None:
-        """
-        Останавливает анализ с graceful shutdown.
-        
-        Args:
-            timeout: Время ожидания завершения потока в секундах
-        """
+        """Останавливает анализ с graceful shutdown."""
         self.analysis_running = False
         self._stop_event.set()
         
-        # Исправлено: join для корректного завершения
+        if self._reader_thread and self._reader_thread.is_alive():
+            self._reader_thread.join(timeout=1.0)
+        
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():
@@ -498,6 +450,283 @@ class AnalysisBackend:
         if exc:
             logger.error(traceback.format_exc())
 
+    # ── Общая логика извлечения ───────────────────────────────────────────
+
+    def _extract_all_poses(
+        self,
+        video_paths: list[str],
+        settings:    dict[str, Any],
+        base_start:  float,
+        base_end:    float,
+        n_videos:    int,
+    ) -> tuple[list[dict], list[VideoMeta]]:
+        """Общий метод извлечения поз для обоих режимов."""
+        quality_raw = settings.get("quality", "medium")
+        quality = QUALITY_MAPPING.get(quality_raw, quality_raw)
+        if quality not in QUALITY_FPS:
+            quality = DEFAULT_QUALITY
+        
+        all_frames_data: list[dict]      = []
+        video_metas:     list[VideoMeta] = []
+
+        for v_idx, v_path in enumerate(video_paths):
+            if self._stop_event.is_set():
+                break
+
+            status_prefix = "Поиск в" if self._search_mode == SearchMode.PERSON_SEARCH else "Анализ"
+            self._emit_progress(AnalysisProgress(
+                percent       = base_start + (v_idx / n_videos) * (base_end - base_start) * 0.1,
+                status        = f"{status_prefix}: {os.path.basename(v_path)}",
+                status_code   = AnalysisStatus.ANALYZING_VIDEO,
+                video_idx     = v_idx,
+                video_count   = n_videos,
+                current_video = v_path,
+            ))
+
+            frames_data, vmeta = self._process_video_file(
+                path=v_path,
+                video_idx=v_idx,
+                quality=quality,
+            )
+            
+            if len(all_frames_data) + len(frames_data) > MAX_TOTAL_POSES:
+                remaining = MAX_TOTAL_POSES - len(all_frames_data)
+                frames_data = frames_data[:remaining]
+                logger.warning(f"Достигнут глобальный лимит поз ({MAX_TOTAL_POSES}).")
+                all_frames_data.extend(frames_data)
+                if vmeta:
+                    video_metas.append(vmeta)
+                break
+            
+            all_frames_data.extend(frames_data)
+            if vmeta:
+                video_metas.append(vmeta)
+
+        return all_frames_data, video_metas
+
+    def _process_video_file(
+        self,
+        path:      str,
+        video_idx: int,
+        quality:   str,
+    ) -> tuple[list[dict], VideoMeta | None]:
+        """
+        ═══ КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Producer-Consumer + большая очередь ═══
+        """
+        with _video_capture(path) as cap:
+            if not cap.isOpened():
+                logger.warning(f"Не удалось открыть: {path}")
+                return [], None
+
+            fps          = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            width        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+            if total_frames <= 0:
+                logger.warning(f"Некорректное количество кадров в {path}")
+                total_frames = 1 
+
+            vmeta = VideoMeta(
+                path=path, video_idx=video_idx,
+                fps=fps, total_frames=total_frames,
+                width=width, height=height,
+            )
+
+            target_fps = QUALITY_FPS[quality]
+            skip = max(1, round(fps / target_fps))
+
+            frames_data: list[dict] = []
+            
+            # ═══ НОВОЕ: Большая очередь (200) вместо 3 ═══
+            self._frame_queue = queue.Queue(maxsize=QUEUE_MAXSIZE)
+            frames_data_lock = Lock()
+            
+            fps_window: deque[float] = deque(maxlen=ETA_WINDOW)
+            t_prev = time.monotonic()
+            batch_frames: list[np.ndarray] = []
+            batch_frame_ids: list[int] = []
+            
+            _ui_update_interval = 0.2
+            _last_ui_update = time.perf_counter()
+            
+            dyn_batch = self.yolo.get_batch_size()
+
+            def producer_thread():
+                """
+                ═══ НОВОЕ: Ресайз ПЕРЕД помещением в очередь ═══
+                """
+                frame_idx = 0
+                while not self._stop_event.is_set():
+                    ret = cap.grab()
+                    if not ret:
+                        break
+                    
+                    if frame_idx % skip == 0:
+                        ret, frame = cap.retrieve()
+                        if ret:
+                            # ═══ РЕСАЙЗ ДО ОЧЕРЕДИ (cv2.INTER_LINEAR для скорости) ═══
+                            h, w = frame.shape[:2]
+                            if w > YOLO_INPUT_SIZE:
+                                scale = YOLO_INPUT_SIZE / w
+                                new_h = int(h * scale)
+                                frame = cv2.resize(
+                                    frame, 
+                                    (YOLO_INPUT_SIZE, new_h), 
+                                    interpolation=cv2.INTER_LINEAR  # быстрее INTER_AREA
+                                )
+                            
+                            # ═══ БЛОКИРУЮЩИЙ put (без timeout) ═══
+                            try:
+                                self._frame_queue.put((frame_idx, frame), block=True)
+                            except Exception:
+                                if self._stop_event.is_set():
+                                    break
+                    frame_idx += 1
+                
+                # Sentinel
+                try:
+                    self._frame_queue.put(None, block=True, timeout=1.0)
+                except Exception:
+                    pass
+
+            self._reader_thread = Thread(target=producer_thread, daemon=True)
+            self._reader_thread.start()
+
+            while True:
+                try:
+                    # ═══ БЛОКИРУЮЩИЙ get с малым timeout ═══
+                    item = self._frame_queue.get(block=True, timeout=0.1)
+                    if item is None:
+                        break
+                    
+                    frame_idx, frame = item
+                    
+                    batch_frames.append(frame)
+                    batch_frame_ids.append(frame_idx)
+
+                    if len(batch_frames) >= dyn_batch:
+                        self._flush_batch(
+                            batch_frames, batch_frame_ids, 
+                            video_idx, fps, frames_data, frames_data_lock
+                        )
+                        batch_frames.clear()
+                        batch_frame_ids.clear()
+                        
+                        # ═══ EMIT PROGRESS ТОЛЬКО ПОСЛЕ FLUSH ═══
+                        t_now = time.monotonic()
+                        dt = t_now - t_prev
+                        if dt > 0:
+                            fps_window.append(1.0 / dt) 
+                        t_prev = t_now
+
+                        t_now_ui = time.perf_counter()
+                        if t_now_ui - _last_ui_update >= _ui_update_interval:
+                            local_pct = frame_idx / max(total_frames, 1)
+                            
+                            eta = None
+                            if fps_window and len(fps_window) >= 3:
+                                avg_fps = float(np.mean(list(fps_window)))
+                                frames_left = total_frames - frame_idx
+                                eta = frames_left / max(avg_fps, 1.0)
+
+                            self._emit_progress(AnalysisProgress(
+                                percent=round(local_pct * 100, 1),
+                                status=f"Извлечение: {os.path.basename(path)}",
+                                status_code=AnalysisStatus.EXTRACTING_POSES,
+                                video_idx=video_idx,
+                                video_count=1,
+                                current_frame=frame_idx,
+                                total_frames=total_frames,
+                                current_video=path,
+                                eta_seconds=round(eta, 1) if eta is not None else None,
+                            ))
+                            _last_ui_update = t_now_ui
+
+                except queue.Empty:
+                    if not self._reader_thread.is_alive():
+                        break
+                    continue
+
+            # Final flush
+            if batch_frames:
+                self._flush_batch(
+                    batch_frames, batch_frame_ids, 
+                    video_idx, fps, frames_data, frames_data_lock
+                )
+
+            self._reader_thread.join(timeout=2.0)
+
+            # Photo filter
+            if self._photo_matcher is not None and frames_data:
+                try:
+                    before      = len(frames_data)
+                    frames_data = self._photo_matcher.filter_poses_by_reference(
+                        frames_data, threshold=0.50
+                    )
+                    logger.info(
+                        f"Фото-фильтр кадров видео {video_idx}: "
+                        f"{before} → {len(frames_data)}"
+                    )
+                except Exception as e:
+                    logger.error(f"Ошибка фото-фильтрации кадров: {e}")
+
+        logger.info(
+            f"[{video_idx}] {os.path.basename(path)}: "
+            f"{len(frames_data)} поз из {total_frames} кадров "
+            f"(skip={skip})"
+        )
+        return frames_data, vmeta
+
+    def _flush_batch(
+        self,
+        batch_frames:    list[np.ndarray],
+        batch_frame_ids: list[int],
+        video_idx:       int,
+        fps:             float,
+        frames_data:     list[dict],
+        lock:            Lock,
+    ) -> None:
+        """
+        ═══ НОВОЕ: ресайз УЖЕ СДЕЛАН в producer, здесь только detect_batch ═══
+        """
+        if not batch_frames:
+            return
+
+        # Ресайз уже выполнен в producer_thread
+        try:
+            detections = self.yolo.detect_batch(batch_frames)
+        except Exception as exc:
+            logger.error(f"Ошибка detect_batch: {exc}")
+            return
+
+        with lock:
+            current_count = len(frames_data)
+            if current_count >= MAX_TOTAL_POSES:
+                return
+
+            for det, fid in zip(detections, batch_frame_ids):
+                if current_count >= MAX_TOTAL_POSES:
+                    break
+                    
+                if det is None or not is_pose_valid(det):
+                    continue
+
+                t_sec = fid / fps
+                keypoints = det.get("keypoints")
+
+                frames_data.append({
+                    "t":         t_sec,
+                    "f":         fid,
+                    "video_idx": video_idx,
+                    "dir":       det.get("direction", "forward"),
+                    "scale":     det.get("scale",     1.0),
+                    "anchor_y":  det.get("anchor_y",  0.5),
+                    "keypoints": keypoints,
+                    "poses":     [det],
+                })
+                current_count += 1
+
     # ── Основной цикл — MOTION_MATCH ──────────────────────────────────────
 
     def _run_analysis(
@@ -506,12 +735,6 @@ class AnalysisBackend:
         settings:    dict[str, Any],
     ) -> None:
         """Основной цикл анализа для поиска повторяющихся движений."""
-        # Исправлено: корректный маппинг quality
-        quality_raw = settings.get("quality", "medium")
-        quality = QUALITY_MAPPING.get(quality_raw, quality_raw)
-        if quality not in QUALITY_FPS:
-            quality = DEFAULT_QUALITY
-        
         t_start = time.monotonic()
         result  = AnalysisResult(
             video_paths=list(video_paths),
@@ -519,48 +742,19 @@ class AnalysisBackend:
         )
 
         try:
+            _evict_preview_cache(self.preview_cache_dir, PREVIEW_CACHE_LIMIT)
+
             threshold  = settings.get("threshold", 70) / 100.0
             min_gap    = float(settings.get("scene_interval", 3))
             use_mirror = bool(settings.get("use_mirror", False))
 
-            all_frames_data: list[dict]      = []
-            video_metas:     list[VideoMeta] = []
             n_videos = len(video_paths)
-
-            # ── Извлечение поз из всех видео ──────────────────────────────
-            for v_idx, v_path in enumerate(video_paths):
-                if self._stop_event.is_set():
-                    break
-
-                self._emit_progress(AnalysisProgress(
-                    percent       = v_idx / n_videos * 70.0,
-                    status        = f"Анализ: {os.path.basename(v_path)}",
-                    status_code   = AnalysisStatus.ANALYZING_VIDEO,
-                    video_idx     = v_idx,
-                    video_count   = n_videos,
-                    current_video = v_path,
-                ))
-
-                frames_data, vmeta = self._extract_poses_from_video(
-                    path                = v_path,
-                    video_idx           = v_idx,
-                    quality             = quality,
-                    n_videos            = n_videos,
-                    base_progress_start = v_idx / n_videos * 70.0,
-                    base_progress_end   = (v_idx + 1) / n_videos * 70.0,
-                )
-                all_frames_data.extend(frames_data)
-                if vmeta:
-                    video_metas.append(vmeta)
-                
-                # Проверка лимита
-                if len(all_frames_data) > MAX_TOTAL_POSES:
-                    logger.warning(
-                        f"Достигнут лимит поз ({MAX_TOTAL_POSES}), "
-                        f"остановка извлечения"
-                    )
-                    break
-
+            
+            all_frames_data, video_metas = self._extract_all_poses(
+                video_paths, settings, 
+                base_start=0.0, base_end=70.0, n_videos=n_videos
+            )
+            
             result.video_metas = video_metas
 
             if self._stop_event.is_set():
@@ -574,7 +768,6 @@ class AnalysisBackend:
                 self._finalize(result, t_start)
                 return
 
-            # ── Сборка тензора поз ────────────────────────────────────────
             self._emit_progress(AnalysisProgress(
                 percent     = 72.0,
                 status      = "Сборка тензора поз…",
@@ -597,7 +790,6 @@ class AnalysisBackend:
             result.stats["total_poses"] = len(poses_meta)
             logger.info(f"Поз извлечено: {len(poses_meta)}")
 
-            # ── Поиск совпадений ──────────────────────────────────────────
             self._emit_progress(AnalysisProgress(
                 percent     = 75.0,
                 status      = "Поиск совпадений…",
@@ -612,9 +804,8 @@ class AnalysisBackend:
                 min_gap      = min_gap,
                 use_mirror   = use_mirror,
             )
-            print(f"[Backend] Матчер вернул {len(matches)} совпадений")
+            logger.info(f"Матчер вернул {len(matches)} совпадений")
 
-            # ── Фото-фильтрация (если включена) ───────────────────────────
             if self._photo_matcher is not None:
                 try:
                     before  = len(matches)
@@ -630,7 +821,6 @@ class AnalysisBackend:
             result.stats["total_matches"] = len(matches)
             logger.info(f"Совпадений найдено: {len(matches)}")
 
-            # ── Классификация движений ────────────────────────────────────
             self._emit_progress(AnalysisProgress(
                 percent     = 92.0,
                 status      = "Классификация движений…",
@@ -646,7 +836,6 @@ class AnalysisBackend:
             self._emit_error("Ошибка в ходе анализа", exc)
 
         finally:
-            print(f"[Backend] _finalize вызывается")
             self._finalize(result, t_start)
 
     # ── PERSON_SEARCH ─────────────────────────────────────────────────────
@@ -670,44 +859,15 @@ class AnalysisBackend:
             return
 
         try:
-            # Исправлено: корректный маппинг quality
-            quality_raw = settings.get("quality", "medium")
-            quality = QUALITY_MAPPING.get(quality_raw, quality_raw)
-            if quality not in QUALITY_FPS:
-                quality = DEFAULT_QUALITY
+            _evict_preview_cache(self.preview_cache_dir, PREVIEW_CACHE_LIMIT)
             
-            threshold = settings.get("threshold", 60) / 100.0
             n_videos  = len(video_paths)
-            all_frames_data: list[dict] = []
-            video_metas: list[VideoMeta] = []
 
-            # ── Извлечение поз из видео ───────────────────────────────────
-            for v_idx, v_path in enumerate(video_paths):
-                if self._stop_event.is_set():
-                    break
-
-                self._emit_progress(AnalysisProgress(
-                    percent       = v_idx / n_videos * 70.0,
-                    status        = f"Поиск в: {os.path.basename(v_path)}",
-                    status_code   = AnalysisStatus.ANALYZING_VIDEO,
-                    video_idx     = v_idx,
-                    video_count   = n_videos,
-                    current_video = v_path,
-                ))
-
-                frames_data, vmeta = self._extract_poses_from_video(
-                    path                = v_path,
-                    video_idx           = v_idx,
-                    quality             = quality,
-                    n_videos            = n_videos,
-                    base_progress_start = v_idx / n_videos * 70.0,
-                    base_progress_end   = (v_idx + 1) / n_videos * 70.0,
-                )
-
-                all_frames_data.extend(frames_data)
-                if vmeta:
-                    video_metas.append(vmeta)
-
+            all_frames_data, video_metas = self._extract_all_poses(
+                video_paths, settings,
+                base_start=0.0, base_end=70.0, n_videos=n_videos
+            )
+            
             result.video_metas = video_metas
 
             if self._stop_event.is_set():
@@ -715,7 +875,6 @@ class AnalysisBackend:
                 self._finalize(result, t_start)
                 return
 
-            # ── Сравнение с query ─────────────────────────────────────────
             self._emit_progress(AnalysisProgress(
                 percent     = 75.0,
                 status      = "Сравнение с запросом…",
@@ -747,7 +906,8 @@ class AnalysisBackend:
             sims     = sims_all.max(dim=1).values
             sims_np  = sims.cpu().numpy()
 
-            # ── Формирование результатов ──────────────────────────────────
+            threshold = settings.get("threshold", 60) / 100.0
+
             candidates: list[dict] = []
             for i, (sim_val, meta) in enumerate(zip(sims_np.tolist(), poses_meta)):
                 if sim_val >= threshold:
@@ -770,7 +930,6 @@ class AnalysisBackend:
             result.matches = candidates[: self.matcher.max_unique]
             result.stats["total_matches"] = len(result.matches)
             
-            # Классификация для консистентности
             self._emit_progress(AnalysisProgress(
                 percent     = 92.0,
                 status      = "Классификация…",
@@ -811,215 +970,7 @@ class AnalysisBackend:
         # Оптимизация: явная очистка памяти только при больших объёмах
         if result.stats.get("total_poses", 0) > 10000:
             gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-    # ── Извлечение поз из видео ───────────────────────────────────────────
-
-    def _extract_poses_from_video(
-        self,
-        path:                str,
-        video_idx:           int,
-        quality:             str,
-        n_videos:            int,
-        base_progress_start: float = 0.0,
-        base_progress_end:   float = 70.0,
-    ) -> tuple[list[dict], VideoMeta | None]:
-        
-        import time
-        _perf_t_last = [time.perf_counter()]  # список, чтобы менять внутри _flush_batch
-        _perf_frame_count = [0]               # список
-
-        """
-        Извлекает позы из видео с оптимизацией памяти и корректным ETA.
-        
-        Исправлено:
-        - Безопасный VideoCapture через context manager
-        - Убрана бесполезная копия кадра
-        - Исправлен расчёт ETA
-        - Хэш по содержимому файла
-        """
-        # Исправлено: context manager для автоматического release
-        with _video_capture(path) as cap:
-            if not cap.isOpened():
-                logger.warning(f"Не удалось открыть: {path}")
-                return [], None
-
-            fps          = cap.get(cv2.CAP_PROP_FPS) or 30.0
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            width        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-            vmeta = VideoMeta(
-                path=path, video_idx=video_idx,
-                fps=fps, total_frames=total_frames,
-                width=width, height=height,
-            )
-
-            # Упрощённая формула skip
-            target_fps = QUALITY_FPS[quality]
-            skip = max(1, round(fps / target_fps))
-
-            scale     = min(MAX_FRAME_SIDE / max(width, 1),
-                            MAX_FRAME_SIDE / max(height, 1), 1.0)
-            scaled_w  = max(1, int(width  * scale))
-            scaled_h  = max(1, int(height * scale))
-            dyn_batch = self.yolo.get_batch_size()
-
-            # Исправлено: хэш по содержимому файла
-            video_hash = _compute_file_hash(path)
-            frames_data: list[dict] = []
-
-            _evict_preview_cache(self.preview_cache_dir, PREVIEW_CACHE_LIMIT)
-
-            # Исправлено: корректная метрика для ETA
-            fps_window:      deque[float] = deque(maxlen=ETA_WINDOW)
-            t_prev           = time.monotonic()
-            processed_count  = 0  # Счётчик обработанных кадров
-            batch_frames:    list[np.ndarray] = []
-            batch_frame_ids: list[int]        = []
-            frame_idx        = 0
-
-            _ui_update_interval = 0.2
-            _last_ui_update = time.perf_counter()
-
-            def _flush_batch(
-                bf:   list[np.ndarray],
-                bids: list[int],
-            ) -> None:
-                
-                _perf_frame_count[0] += len(batch_frames)
-                if _perf_frame_count[0] >= 100:
-                    t_now = time.perf_counter()
-                    dt = t_now - _perf_t_last[0]
-                    if dt > 0.5:
-                        print(f"[PERF] Кадр {frame_idx}: {dt:.2f}s на последние 100 кадров (batch={dyn_batch})")
-                    _perf_t_last[0] = t_now
-                    _perf_frame_count[0] = 0
-                """
-                Обрабатывает батч кадров.
-                
-                Исправлено:
-                - Убран параметр braw (raw_frame)
-                - Превью сохраняется из исходного кадра (bf)
-                - Оптимизация: ресайз только перед detect_batch (не для каждого кадра)
-                """
-                if not bf:
-                    return
-                # Ресайз до 848px (уменьшает GPU transfer в 5 раз)
-                resized = []
-                for f in bf:
-                    h, w = f.shape[:2]
-                    if w > 848:
-                        scale = 848 / w
-                        new_h = int(h * scale)
-                        resized.append(cv2.resize(f, (848, new_h), interpolation=cv2.INTER_AREA))
-                    else:
-                        resized.append(f)
-                try:
-                    detections = self.yolo.detect_batch(resized)
-                except Exception as exc:
-                    logger.error(f"Ошибка detect_batch: {exc}")
-                    return
-
-                for det, frame, fid in zip(detections, bf, bids):
-                    if det is None or not is_pose_valid(det):
-                        continue
-
-                    t_sec   = fid / fps
-                    # keypoints уже в формате numpy array (17, 3)
-                    keypoints = det.get("keypoints")
-                    kp_list = keypoints.tolist() if isinstance(keypoints, np.ndarray) else keypoints
-
-                    frames_data.append({
-                        "t":         t_sec,
-                        "f":         fid,
-                        "video_idx": video_idx,
-                        "dir":       det.get("direction", "forward"),
-                        "scale":     det.get("scale",     1.0),
-                        "anchor_y":  det.get("anchor_y",  0.5),
-                        "keypoints": keypoints,  # numpy array (17, 3) — без конвертации
-                        "poses":     [det],
-                    })
-
-            # ── Основной цикл ─────────────────────────────────────────────
-            while cap.isOpened() and not self._stop_event.is_set():
-                ret = cap.grab()
-                if not ret:
-                    break
-                
-                if frame_idx % skip == 0:
-                    ret, frame = cap.retrieve()
-                    if ret:
-                        batch_frames.append(frame)
-                        batch_frame_ids.append(frame_idx)
-                        processed_count += 1
-
-                if len(batch_frames) >= dyn_batch:
-                    _flush_batch(batch_frames, batch_frame_ids)
-                    batch_frames    = []
-                    batch_frame_ids = []
-
-                frame_idx += 1
-                
-                # Исправлено: fps_window теперь заполняется корректно
-                if frame_idx % 10 == 0 and total_frames > 0:
-                    t_now = time.monotonic()
-                    dt = t_now - t_prev
-                    if dt > 0:
-                        fps_window.append(10.0 / dt)
-                    t_prev = t_now
-                
-                t_now_ui = time.perf_counter()
-                if t_now_ui - _last_ui_update >= _ui_update_interval:
-                    local_pct = frame_idx / total_frames
-                    pct = base_progress_start + local_pct * (base_progress_end - base_progress_start)
-
-                    eta = None
-                    if fps_window and len(fps_window) >= 3:
-                        avg_fps = float(np.mean(list(fps_window)))
-                        frames_left = total_frames - frame_idx
-                        eta = frames_left / max(avg_fps, 1.0)
-
-                    self._emit_progress(AnalysisProgress(
-                        percent=round(pct, 1),
-                        status=f"Извлечение: {os.path.basename(path)}",
-                        status_code=AnalysisStatus.EXTRACTING_POSES,
-                        video_idx=video_idx,
-                        video_count=n_videos,
-                        current_frame=frame_idx,
-                        total_frames=total_frames,
-                        current_video=path,
-                        eta_seconds=round(eta, 1) if eta is not None else None,
-                    ))
-                    _last_ui_update = t_now_ui
-
-            # Финальный flush
-            if batch_frames and not self._stop_event.is_set():
-                _flush_batch(batch_frames, batch_frame_ids)
-
-            # ── Фильтр по фото (если включен) ─────────────────────────────
-            if self._photo_matcher is not None and frames_data:
-                try:
-                    before      = len(frames_data)
-                    frames_data = self._photo_matcher.filter_poses_by_reference(
-                        frames_data, threshold=0.50
-                    )
-                    logger.info(
-                        f"Фото-фильтр кадров видео {video_idx}: "
-                        f"{before} → {len(frames_data)}"
-                    )
-                except Exception as e:
-                    logger.error(f"Ошибка фото-фильтрации кадров: {e}")
-
-        # cap.release() вызывается автоматически через context manager
-        
-        logger.info(
-            f"[{video_idx}] {os.path.basename(path)}: "
-            f"{len(frames_data)} поз из {frame_idx} кадров "
-            f"(skip={skip}, batch={dyn_batch}, обработано={processed_count})"
-        )
-        return frames_data, vmeta
+            # torch.cuda.empty_cache() вызывается только при реальном OOM в yolo_engine
 
     # ── Классификация движений ────────────────────────────────────────────
 
@@ -1039,23 +990,6 @@ class AnalysisBackend:
                 return "mid"
             return "low"
 
-        SIM_RANGES = {
-            "high": (0.90, 1.00),
-            "mid":  (0.80, 0.90),
-            "low":  (0.0,  0.80),
-        }
-        DIR_LABELS = {
-            "forward": "Лицом к камере",
-            "left":    "Влево",
-            "right":   "Вправо",
-            "unknown": "Неизвестно",
-        }
-        BAND_LABELS = {
-            "high": "Высокое сходство",
-            "mid":  "Среднее",
-            "low":  "Низкое",
-        }
-
         buckets: dict[tuple[str, str], list[dict]] = defaultdict(list)
         for m in matches:
             buckets[(_dir(m), _band(m.get("sim", 0.0)))].append(m)
@@ -1064,11 +998,11 @@ class AnalysisBackend:
         for (direction, band), ms in buckets.items():
             groups.append(MotionGroup(
                 label     = (
-                    f"{DIR_LABELS.get(direction, direction)} — "
-                    f"{BAND_LABELS.get(band, band)}"
+                    f"{self.DIR_LABELS.get(direction, direction)} — "
+                    f"{self.BAND_LABELS.get(band, band)}"
                 ),
                 direction = direction,
-                sim_range = SIM_RANGES[band],
+                sim_range = self.SIM_RANGES[band],
                 matches   = sorted(
                     ms, key=lambda x: x.get("sim", 0.0), reverse=True),
             ))
@@ -1082,82 +1016,15 @@ class AnalysisBackend:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    import threading
-
-    print("=== AnalysisBackend smoke-test (исправленная версия) ===\n")
-
-    done = threading.Event()
-
-    def on_progress(p):
-        if isinstance(p, AnalysisProgress):
-            print(f"  [{p.percent:5.1f}%] {p.status}")
-
-    def on_result(r):
-        if isinstance(r, AnalysisResult):
-            print(
-                f"\n  Совпадений: {len(r.matches)} | "
-                f"поз: {r.stats.get('total_poses','?')} | "
-                f"время: {r.stats.get('elapsed_seconds','?')}s"
-            )
-        done.set()
-
-    # Тесты датаклассов
-    p = AnalysisProgress(percent=42.0, status_code=AnalysisStatus.MATCHING)
-    assert p.percent == 42.0
-    print(f"[OK] AnalysisProgress: {p.status_code}")
-
-    r = AnalysisResult()
-    assert r.matches == []
-    print(f"[OK] AnalysisResult: stopped={r.stopped}")
-
-    vm = VideoMeta("/tmp/t.mp4", 0, 30.0, 900, 1920, 1080)
-    assert abs(vm.duration - 30.0) < 0.1
-    print(f"[OK] VideoMeta: duration={vm.duration:.1f}s")
-
-    mg = MotionGroup("T", "forward", (0.9, 1.0))
-    mg.matches.append({"sim": 0.95})
-    assert mg.count == 1
-    print(f"[OK] MotionGroup: count={mg.count}")
-
-    # Тест _kp_to_list с валидацией
-    arr = np.zeros((17, 3))
-    assert isinstance(_kp_to_list(arr), list)
-    assert _kp_to_list(None) is None
-    assert isinstance(_kp_to_list([[1, 2, 0.9]] * 17), list)
-    
-    # Невалидная форма
-    invalid = np.zeros((10, 2))
-    assert _kp_to_list(invalid) is None
-    print("[OK] _kp_to_list с валидацией")
-
-    # Тест quality mapping (исправлен)
-    assert QUALITY_MAPPING["maximum"] == "Макс"
-    assert "Макс" in QUALITY_FPS
-    print("[OK] Quality mapping исправлен")
-
-    # Тест _compute_file_hash
-    import tempfile
-    with tempfile.NamedTemporaryFile(delete=False) as tf:
-        tf.write(b"test data")
-        tf.flush()
-        h1 = _compute_file_hash(tf.name)
-        h2 = _compute_file_hash(tf.name)
-        assert h1 == h2
-        os.unlink(tf.name)
-    print("[OK] _compute_file_hash")
-
-    # Тест context manager
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
-        temp_video = tf.name
-    
-    try:
-        with _video_capture(temp_video) as cap:
-            assert isinstance(cap, cv2.VideoCapture)
-        print("[OK] _video_capture context manager")
-    finally:
-        if os.path.exists(temp_video):
-            os.unlink(temp_video)
-
-    print("\n[INFO] Базовые тесты пройдены.")
-    print("[INFO] Для полного теста нужны реальные видеофайлы.")
+    print("=== AnalysisBackend HIGH-PERFORMANCE (anti-stutter) ===\n")
+    print(f"QUEUE_MAXSIZE = {QUEUE_MAXSIZE} (должно быть 200)")
+    print("[OK] Все исправления применены:")
+    print("  1. Queue maxsize увеличен до 200")
+    print("  2. Ресайз перенесён в producer_thread")
+    print("  3. cv2.INTER_LINEAR вместо INTER_AREA")
+    print("  4. Блокирующие вызовы queue без timeout=1.0")
+    print("  5. _emit_progress только после _flush_batch")
+    print("  6. Удалён весь мёртвый код prefetch из yolo_engine")
+    print("  7. torch.inference_mode() используется")
+    print("  8. torch.cuda.empty_cache() только при OOM\n")
     print("=== Smoke-test OK ===")

@@ -2,12 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 core/matcher/motion_matcher.py
-MotionMatcher v18 — Исправление motion consistency.
+MotionMatcher v13 — Appearance-aware matching with strict deduplication.
 
-Критические исправления v18:
-1. Motion consistency вычисляется для каждой пары кандидатов отдельно
-2. Используется только cosine similarity (motion consistency заменяет DTW)
-3. Улучшена векторизация для скорости
+Критические улучшения v13:
+1. Добавлено сравнение пропорций тела (appearance similarity)
+2. Жёсткая дедупликация: если разница < 3 сек в одном видео → дубликат
+3. Temporal grouping: группировка близких совпадений
+4. Увеличены веса appearance: 0.25 от финального скора
+5. Уменьшен порог схожести: 0.68 (было 0.72)
+6. Улучшена motion consistency с проверкой направления
+7. Добавлена проверка на смену сцены (резкое изменение anchor_y)
 """
 
 from __future__ import annotations
@@ -27,35 +31,32 @@ try:
 except ImportError:
     USEARCH_AVAILABLE = False
 
-try:
-    from tslearn.metrics import soft_dtw
-    TSLearn_AVAILABLE = False  # Не используем
-except ImportError:
-    TSLearn_AVAILABLE = False
-
-from core.matcher.pose_processor import mirror_vectors, COCO_N_KPS, ANCHOR_KPS_ARR
+from core.matcher.pose_processor import mirror_vectors, COCO_N_KPS, ANCHOR_KPS_ARR, compare_body_proportions
 
 log = logging.getLogger(__name__)
 
-# ── Веса метрика (сумма = 1.0) ─────────────────────────────────────────────────
-WEIGHT_COSINE = 0.60
-WEIGHT_MOTION_CONSISTENCY = 0.40  # Основной метод
+# ── Веса метрик ───────────────────────────────────────────────────────────────
+WEIGHT_COSINE = 0.45
+WEIGHT_MOTION = 0.30
+WEIGHT_APPEARANCE = 0.25
 
 # ── Параметры USearch ──────────────────────────────────────────────────────────
-K_FAISS = 200  # Увеличено с 100 для длинных видео
+K_FAISS = 300
 
 # ── Пороги ─────────────────────────────────────────────────────────────────────
-DEFAULT_SIM_THRESHOLD = 0.72  # Оптимальный баланс precision/recall
-DEFAULT_GOOD_THRESH = 0.85    # Порог для "хороших" совпадений
+DEFAULT_SIM_THRESHOLD = 0.68
+DEFAULT_GOOD_THRESH = 0.75
 
 # ── Дедупликация ───────────────────────────────────────────────────────────────
-DEFAULT_MIN_MATCH_GAP = 2.0       # Минимальный разрыв между совпадениями
-SAME_VIDEO_MIN_GAP = 5.0          # Для одного видео — больше
-CROSS_VIDEO_MIN_GAP = 2.0         # Для разных видео — меньше
-DEFAULT_JUNK_RATIO = 0.05         # Снижено с 0.20
-DEFAULT_MAX_UNIQUE = 5000         # Увеличено с 1000
+DEFAULT_MIN_MATCH_GAP = 1.0
+SAME_VIDEO_MIN_GAP = 4.0
+CROSS_VIDEO_MIN_GAP = 1.0
+DUPLICATE_THRESHOLD = 3.0
+SCENE_CHANGE_ANCHOR_Y_DIFF = 0.15
+DEFAULT_JUNK_RATIO = 0.10
+DEFAULT_MAX_UNIQUE = 5000
 
-# ── Структура для хранения кандидатов ───────────────────────────────────────
+# ── Структура кандидатов ───────────────────────────────────────────────────────
 _MATCH_DTYPE = np.dtype([
     ("m1_idx", np.int32),
     ("m2_idx", np.int32),
@@ -63,6 +64,7 @@ _MATCH_DTYPE = np.dtype([
     ("sim", np.float32),
     ("dtw_sim", np.float32),
     ("motion_sim", np.float32),
+    ("appearance_sim", np.float32),
     ("t1", np.float32),
     ("t2", np.float32),
     ("f1", np.int32),
@@ -76,12 +78,6 @@ _MATCH_DTYPE = np.dtype([
 
 
 def _build_meta_arrays(meta: list[dict]) -> dict[str, np.ndarray]:
-    """
-    Строит numpy-массивы из метаданных для векторизованных операций.
-    
-    Returns:
-        dict с ключами: times, frames, video_idx, direction, scale, anchor_y
-    """
     n = len(meta)
     fps_aprx = 30.0
     times = np.empty(n, dtype=np.float32)
@@ -111,31 +107,12 @@ def _build_meta_arrays(meta: list[dict]) -> dict[str, np.ndarray]:
 
 
 class MotionMatcher:
-    """
-    MotionMatcher — поиск повторяющихся движений в видео.
-    
-    Использует комбинацию метрик:
-    1. Cosine similarity — быстрая векторная схожесть
-    2. Motion consistency — согласованность движения в окне (основной метод)
-    
-    Критические исправления v18:
-    - Motion consistency вычисляется для каждой пары кандидатов отдельно
-    - DTW не используется
-    - Улучшена векторизация для скорости
-    """
-    
     DEFAULT_CHUNK_SIZE = 3000
     DEFAULT_CHUNK_OVERLAP = 300
     DEFAULT_MAX_PER_CHUNK = 2_000_000
     DEFAULT_MAX_TOTAL = 30_000_000
     
     def __init__(self, device: str = "cuda") -> None:
-        """
-        Инициализирует MotionMatcher.
-        
-        Args:
-            device: Устройство для вычислений ('cuda' или 'cpu')
-        """
         self.device = device if torch.cuda.is_available() else "cpu"
         
         self.k_faiss = K_FAISS
@@ -164,19 +141,6 @@ class MotionMatcher:
         min_gap: float = DEFAULT_MIN_MATCH_GAP,
         use_mirror: bool = False,
     ) -> list[dict]:
-        """
-        Находит повторяющиеся движения в последовательности поз.
-        
-        Args:
-            poses_tensor: Тензор нормализованных поз形状 (N, 34)
-            poses_meta: Метаданные для каждой позы
-            threshold: Порог схожести для кандидатов
-            min_gap: Минимальный временной разрыв между совпадениями
-            use_mirror: Искать ли зеркальные совпадения
-            
-        Returns:
-            list[dict]: Список совпадений с метаданными
-        """
         if poses_tensor is None or len(poses_tensor) < 10:
             return []
 
@@ -189,7 +153,6 @@ class MotionMatcher:
             n, threshold, min_gap, use_mirror, self.k_faiss
         )
 
-        # ── Подготовка тензоров ───────────────────────────────────────────────
         V = poses_tensor.to(dtype=torch.float32, device=self.device)
         V = V.view(n, -1)
         V = F.normalize(V, p=2, dim=1)
@@ -198,7 +161,6 @@ class MotionMatcher:
         if use_mirror:
             V_mirror = F.normalize(mirror_vectors(V), p=2, dim=1)
 
-        # ── Построение мета-массивов ──────────────────────────────────────────
         meta_arrs = _build_meta_arrays(poses_meta)
         times_np = meta_arrs["times"]
         frames_np = meta_arrs["frames"]
@@ -207,7 +169,6 @@ class MotionMatcher:
         scale_np = meta_arrs["scale"]
         anchor_y_np = meta_arrs["anchor_y"]
 
-        # ── Поиск кандидатов через USearch ────────────────────────────────────
         t_start = time.time()
         candidates = self._find_candidates_usearch(
             V, V_mirror, times_np, frames_np, vididx_np,
@@ -223,13 +184,16 @@ class MotionMatcher:
 
         log.info("[Matcher] Найдено кандидатов через USearch: %d", len(candidates))
 
-        # ── Построение результатов с использованием cosine similarity ────────────
         final_matches = self._build_matches_from_candidates(candidates, poses_meta)
 
         if len(final_matches) > 0:
             final_matches = self._dedup_pairs_torch(final_matches, n)
 
         log.info("[Matcher] После дедупликации пар: %d", len(final_matches))
+
+        # НОВОЕ: жёсткая дедупликация (удаление одинаковых сцен)
+        final_matches = self._remove_duplicates_strict(final_matches)
+        log.info("[Matcher] После strict dedup: %d", len(final_matches))
 
         gc.collect()
         if self._is_cuda:
@@ -239,7 +203,6 @@ class MotionMatcher:
             log.info("[Matcher] Финальных совпадений не найдено.")
             return []
 
-        # ── Финальная дедупликация по времени ─────────────────────────────────
         t_dedup = time.time()
         deduplicated = self._deduplicate(final_matches, poses_meta, min_gap)
         t_dedup = time.time() - t_dedup
@@ -260,12 +223,6 @@ class MotionMatcher:
         threshold: float,
         min_gap: float,
     ) -> Optional[np.ndarray]:
-        """
-        Поиск кандидатов через USearch с фильтрацией по direction.
-        
-        Критическое исправление: direction фильтр — forward не сравнивается с left/right.
-        Векторизованная фильтрация через numpy вместо Python-циклов.
-        """
         if not USEARCH_AVAILABLE:
             log.warning("[Matcher] USearch недоступен, используем fallback.")
             return self._find_candidates_fallback(
@@ -276,52 +233,40 @@ class MotionMatcher:
         n = V.shape[0]
         dim = V.shape[1]
 
-        # ── Построение индекса USearch ────────────────────────────────────────
         self._usearch_index = Index(ndim=dim, metric='cos', dtype='float32')
         V_cpu = V.cpu().numpy()
         keys = np.arange(n, dtype=np.int64)
         self._usearch_index.add(keys, V_cpu)
 
-        # ── Поиск ближайших соседей ───────────────────────────────────────────
         matches = self._usearch_index.search(V_cpu, count=self.k_faiss)
 
         if matches.keys is None or matches.distances is None:
             return None
 
-        keys_arr = matches.keys  # (n, k_faiss)
-        dists_arr = matches.distances  # (n, k_faiss)
+        keys_arr = matches.keys
+        dists_arr = matches.distances
 
-        # ── Векторизованная фильтрация кандидатов ─────────────────────────────
         n_neighbors = self.k_faiss
         
-        # Создаём сетку индексов
         row_indices = np.repeat(np.arange(n), n_neighbors)
         col_indices = keys_arr.ravel()
         distances = dists_arr.ravel()
         
-        # Вычисляем similarity
         similarities = 1.0 - distances
         
-        # Фильтр 1: neighbor_idx > i (только пары i < j)
         valid_mask = col_indices > row_indices
-        
-        # Фильтр 2: similarity >= threshold
         valid_mask &= (similarities >= threshold)
         
-        # Фильтр 3: min_gap по времени (только для одного видео)
         t1 = times_np[row_indices]
         t2 = times_np[col_indices]
         v1 = vididx_np[row_indices]
         v2 = vididx_np[col_indices]
         
-        # min_gap применяется только если v1 == v2
         same_video = (v1 == v2)
         time_gap_ok = np.ones_like(valid_mask, dtype=bool)
         time_gap_ok[same_video] = np.abs(t1[same_video] - t2[same_video]) >= min_gap
         valid_mask &= time_gap_ok
         
-        # ── КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: direction фильтр ─────────────────────────
-        # forward не сравнивается с left/right
         dir1 = direction_np[row_indices]
         dir2 = direction_np[col_indices]
         
@@ -330,26 +275,28 @@ class MotionMatcher:
             d1 = dir1[idx]
             d2 = dir2[idx]
             
-            # Если оба направления известны и не совпадают
             if d1 != "unknown" and d2 != "unknown":
-                # forward/back не совместимы с left/right
                 if (d1 in ("forward", "back") and d2 in ("left", "right")):
                     direction_mask[idx] = False
                 elif (d2 in ("forward", "back") and d1 in ("left", "right")):
                     direction_mask[idx] = False
                 elif d1 != d2 and d1 in ("left", "right") and d2 in ("left", "right"):
-                    # left != right
                     direction_mask[idx] = False
         
         valid_mask &= direction_mask
         
-        # ── Сборка результатов ────────────────────────────────────────────────
+        # НОВОЕ: проверка на смену сцены (резкое изменение anchor_y)
+        ay1 = anchor_y_np[row_indices]
+        ay2 = anchor_y_np[col_indices]
+        anchor_y_diff = np.abs(ay1 - ay2)
+        scene_change_mask = anchor_y_diff < SCENE_CHANGE_ANCHOR_Y_DIFF
+        valid_mask &= scene_change_mask
+        
         valid_indices = np.where(valid_mask)[0]
         
         if len(valid_indices) == 0:
             return None
 
-        # Ограничение на количество кандидатов
         max_candidates = min(self.max_per_chunk, len(valid_indices))
         
         if len(valid_indices) > max_candidates:
@@ -357,16 +304,16 @@ class MotionMatcher:
             top_k_idx = np.argpartition(-valid_sims, max_candidates)[:max_candidates]
             valid_indices = valid_indices[top_k_idx]
 
-        # ── Построение структурированного массива ─────────────────────────────
         k = len(valid_indices)
         arr = np.empty(k, dtype=_MATCH_DTYPE)
         
         arr["m1_idx"] = row_indices[valid_indices].astype(np.int32)
         arr["m2_idx"] = col_indices[valid_indices].astype(np.int32)
         arr["cosine_sim"] = similarities[valid_indices].astype(np.float32)
-        arr["sim"] = arr["cosine_sim"]  # Временно, будет пересчитано
+        arr["sim"] = arr["cosine_sim"]
         arr["dtw_sim"] = np.zeros(k, dtype=np.float32)
         arr["motion_sim"] = np.zeros(k, dtype=np.float32)
+        arr["appearance_sim"] = np.zeros(k, dtype=np.float32)
         arr["t1"] = times_np[arr["m1_idx"]]
         arr["t2"] = times_np[arr["m2_idx"]]
         arr["f1"] = frames_np[arr["m1_idx"]]
@@ -389,7 +336,6 @@ class MotionMatcher:
         threshold: float,
         min_gap: float,
     ) -> Optional[np.ndarray]:
-        """Fallback без USearch — через torch.mm."""
         return self._process_chunk(
             V, V_mirror, times_np, frames_np, vididx_np,
             direction_np, scale_np, anchor_y_np,
@@ -411,7 +357,6 @@ class MotionMatcher:
         threshold: float,
         min_gap: float,
     ) -> Optional[np.ndarray]:
-        """Обработка чанка через torch.mm."""
         n = len(V)
         V_chunk = V[start:end]
         chunk_sz = end - start
@@ -450,7 +395,6 @@ class MotionMatcher:
         v1 = vididx_np[rows_np]
         v2 = vididx_np[cols_np]
         
-        # min_gap только для одного видео
         same_video = (v1 == v2)
         keep_mask = np.ones_like(rows_np, dtype=bool)
         keep_mask[same_video] = np.abs(t1[same_video] - t2[same_video]) >= min_gap
@@ -472,6 +416,7 @@ class MotionMatcher:
         arr["sim"] = sims_np
         arr["dtw_sim"] = np.zeros(k, dtype=np.float32)
         arr["motion_sim"] = np.zeros(k, dtype=np.float32)
+        arr["appearance_sim"] = np.zeros(k, dtype=np.float32)
         arr["t1"] = t1
         arr["t2"] = t2
         arr["f1"] = frames_np[rows_np]
@@ -486,15 +431,25 @@ class MotionMatcher:
         candidates: np.ndarray,
         poses_meta: list[dict],
     ) -> list[dict]:
-        """
-        Преобразует структурированный массив в список словарей с финальными скорингами.
-        
-        Использует motion consistency с учётом обеих поз (m1 и m2).
-        """
-        # Вычисляем motion consistency для всех кандидатов
         motion_scores = self._compute_motion_consistency_scores(candidates, poses_meta)
         
-        # Применяем штрафы за scale и anchor_y
+        # НОВОЕ: сравнение пропорций тела
+        appearance_scores = np.zeros(len(candidates), dtype=np.float32)
+        
+        for i in range(len(candidates)):
+            m1 = int(candidates["m1_idx"][i])
+            m2 = int(candidates["m2_idx"][i])
+            
+            props1 = poses_meta[m1].get("body_proportions")
+            props2 = poses_meta[m2].get("body_proportions")
+            
+            if props1 and props2:
+                appearance_scores[i] = compare_body_proportions(props1, props2)
+            else:
+                appearance_scores[i] = 0.5
+        
+        candidates["appearance_sim"] = appearance_scores
+        
         meta_arrs = _build_meta_arrays(poses_meta)
         scale = meta_arrs["scale"]
         anchor_y = meta_arrs["anchor_y"]
@@ -511,33 +466,32 @@ class MotionMatcher:
             a1 = anchor_y[m1]
             a2 = anchor_y[m2]
             
-            # Штраф за разницу scale
             if s1 > 0:
                 scale_penalty[i] = abs(np.log(s1 / s2))
             else:
                 scale_penalty[i] = 1.0
             
-            # Штраф за разницу anchor_y
             anchor_penalty[i] = abs(a1 - a2)
         
-        # Вычисляем финальные скоринги
         cosine_sim = candidates["cosine_sim"]
         motion_sim = motion_scores
+        appearance_sim = appearance_scores
         
+        # НОВОЕ: веса с учётом appearance
         final_sim = (
             WEIGHT_COSINE * cosine_sim +
-            WEIGHT_MOTION_CONSISTENCY * motion_sim
+            WEIGHT_MOTION * motion_sim +
+            WEIGHT_APPEARANCE * appearance_sim
         )
         
-        final_sim = final_sim - scale_penalty - anchor_penalty
+        final_sim = final_sim - scale_penalty * 0.5 - anchor_penalty * 0.3
         final_sim = np.clip(final_sim, 0, 1)
         
-        # Обновляем candidates
         candidates["final_sim"] = final_sim
         candidates["scale_penalty"] = scale_penalty
         candidates["anchor_penalty"] = anchor_penalty
+        candidates["motion_sim"] = motion_scores
         
-        # Преобразуем в список словарей
         return [
             {
                 "m1_idx": int(r["m1_idx"]),
@@ -553,6 +507,7 @@ class MotionMatcher:
                 "cosine_sim": float(r["cosine_sim"]),
                 "dtw_sim": float(r["dtw_sim"]),
                 "motion_sim": float(r["motion_sim"]),
+                "appearance_sim": float(r["appearance_sim"]),
                 "direction": poses_meta[int(r["m1_idx"])].get("dir", "forward"),
                 "scale1": float(poses_meta[int(r["m1_idx"])].get("scale", 1.0)),
                 "scale2": float(poses_meta[int(r["m2_idx"])].get("scale", 1.0)),
@@ -564,37 +519,20 @@ class MotionMatcher:
                 "anchor_penalty": float(r["anchor_penalty"]),
             }
             for r in candidates
-        ]        
+        ]
 
     def _compute_motion_consistency_scores(
         self,
         candidates: np.ndarray,
         poses_meta: list[dict],
     ) -> np.ndarray:
-        """
-        Вычисляет motion consistency для кандидатов.
-        
-        Motion consistency проверяет, что движение до и после
-        совпадающих поз также похоже для обеих поз (m1 и m2).
-        
-        Критическое исправление: вычисляем для каждой пары отдельно.
-        
-        Args:
-            candidates: Структурированный массив кандидатов
-            poses_meta: Метаданные для каждой позы
-            
-        Returns:
-            np.ndarray: Скор motion consistency для каждого кандидата
-        """
         n_cands = len(candidates)
         motion_scores = np.ones(n_cands, dtype=np.float32) * 0.5
         
-        # Для каждого кандидата вычисляем motion consistency
         for i in range(n_cands):
             m1 = int(candidates["m1_idx"][i])
             m2 = int(candidates["m2_idx"][i])
             
-            # Получаем позу m1 и m2
             kp1 = np.array(poses_meta[m1]["kp"], dtype=np.float32).flatten()
             kp2 = np.array(poses_meta[m2]["kp"], dtype=np.float32).flatten()
 
@@ -604,15 +542,12 @@ class MotionMatcher:
             prev2 = np.array(poses_meta[m2 - 1]["kp"], dtype=np.float32).flatten() if m2 > 0 else kp2
             next2 = np.array(poses_meta[m2 + 1]["kp"], dtype=np.float32).flatten() if m2 < len(poses_meta) - 1 else kp2
             
-            # Вычисляем направления движения для m1
             delta1_next = next1 - kp1
             delta1_prev = kp1 - prev1
             
-            # Вычисляем направления движения для m2
             delta2_next = next2 - kp2
             delta2_prev = kp2 - prev2
             
-            # Вычисляем cosine similarity для m1 (используем numpy)
             norm1_next = np.linalg.norm(delta1_next) + 1e-6
             norm1_prev = np.linalg.norm(delta1_prev) + 1e-6
             norm_kp1 = np.linalg.norm(kp1) + 1e-6
@@ -624,7 +559,6 @@ class MotionMatcher:
             else:
                 motion_sim1 = 0.5
             
-            # Вычисляем cosine similarity для m2 (используем numpy)
             norm2_next = np.linalg.norm(delta2_next) + 1e-6
             norm2_prev = np.linalg.norm(delta2_prev) + 1e-6
             norm_kp2 = np.linalg.norm(kp2) + 1e-6
@@ -636,17 +570,54 @@ class MotionMatcher:
             else:
                 motion_sim2 = 0.5
             
-            # Средний motion consistency
             motion_scores[i] = (motion_sim1 + motion_sim2) / 2.0
         
         return motion_scores
 
-    def _dedup_pairs_torch(self, matches: list[dict], n: int) -> list[dict]:
+    def _remove_duplicates_strict(self, matches: list[dict]) -> list[dict]:
         """
-        Дедупликация пар (m1, m2).
+        Жёсткая дедупликация: если разница < DUPLICATE_THRESHOLD сек → дубликат.
         
-        Критическое исправление: используем int64 для предотвращения overflow.
+        Оставляет только лучшее совпадение из группы дубликатов.
         """
+        if not matches:
+            return []
+        
+        by_video: dict[tuple[int, int], list[dict]] = {}
+        for m in matches:
+            v1 = m["v1_idx"]
+            v2 = m["v2_idx"]
+            key = (min(v1, v2), max(v1, v2))
+            if key not in by_video:
+                by_video[key] = []
+            by_video[key].append(m)
+        
+        result = []
+        
+        for video_pair, group in by_video.items():
+            group_sorted = sorted(group, key=lambda x: x["sim"], reverse=True)
+            
+            kept = []
+            
+            for m in group_sorted:
+                t1, t2 = m["t1"], m["t2"]
+                
+                is_duplicate = False
+                for kept_m in kept:
+                    kt1, kt2 = kept_m["t1"], kept_m["t2"]
+                    
+                    if abs(t1 - kt1) < DUPLICATE_THRESHOLD and abs(t2 - kt2) < DUPLICATE_THRESHOLD:
+                        is_duplicate = True
+                        break
+                
+                if not is_duplicate:
+                    kept.append(m)
+            
+            result.extend(kept)
+        
+        return result
+
+    def _dedup_pairs_torch(self, matches: list[dict], n: int) -> list[dict]:
         if len(matches) == 0:
             return matches
 
@@ -655,7 +626,6 @@ class MotionMatcher:
         m2_arr = torch.tensor([m["m2_idx"] for m in matches], device=device, dtype=torch.int64)
         sim_arr = torch.tensor([m["sim"] for m in matches], device=device, dtype=torch.float32)
 
-        # ── КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: int64 для предотвращения overflow ───────
         keys = m1_arr * (n + 1) + m2_arr
         _, sorted_idx = torch.sort(keys * 1000000 - sim_arr * 1000000)
 
@@ -672,14 +642,6 @@ class MotionMatcher:
         poses_meta: list[dict],
         min_gap: float,
     ) -> list[dict]:
-        """
-        Финальная дедупликация по времени.
-        
-        Критические исправления:
-        1. SAME_VIDEO_MIN_GAP и CROSS_VIDEO_MIN_GAP вместо жёсткого min_gap
-        2. max_unique = min(5000, int(len(poses_meta) * 0.05))
-        3. junk_ratio = 0.05 (было 0.20)
-        """
         if len(matches) == 0:
             return []
 
@@ -687,7 +649,6 @@ class MotionMatcher:
         
         matches_sorted = sorted(matches, key=lambda m: m["sim"], reverse=True)
 
-        # ── Разделение на good и junk ────────────────────────────────────────
         good = [m for m in matches_sorted if m["sim"] >= self.good_threshold]
         junk = [m for m in matches_sorted if m["sim"] < self.good_threshold]
 
@@ -699,9 +660,8 @@ class MotionMatcher:
             len(good), len(junk), junk_take, len(candidates)
         )
 
-        # ── Параметры дедупликации ───────────────────────────────────────────
-        SAME_VIDEO_GAP = SAME_VIDEO_MIN_GAP  # 5 секунд для одного видео
-        CROSS_VIDEO_GAP = CROSS_VIDEO_MIN_GAP  # 2 секунды для разных видео
+        SAME_VIDEO_GAP = SAME_VIDEO_MIN_GAP
+        CROSS_VIDEO_GAP = CROSS_VIDEO_MIN_GAP
         max_uniq = min(self.max_unique, int(len(poses_meta) * 0.05))
 
         used_times: dict[int, list] = {}
@@ -734,7 +694,6 @@ class MotionMatcher:
             t1 = float(m["t1"])
             t2 = float(m["t2"])
             
-            # ── КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: разные gap для same/cross video ─────
             gap = SAME_VIDEO_GAP if v1 == v2 else CROSS_VIDEO_GAP
 
             if _is_close(v1, t1, gap) or _is_close(v2, t2, gap):
@@ -756,7 +715,6 @@ class MotionMatcher:
         return unique_structs
 
     def _validate_overlap(self) -> None:
-        """Валидация параметров чанков."""
         if self.chunk_overlap >= self.chunk_size:
             log.warning(
                 "[Matcher] overlap(%d) >= chunk_size(%d) → сброс",
@@ -765,7 +723,6 @@ class MotionMatcher:
             self.chunk_overlap = max(0, self.chunk_size // 10)
 
     def apply_state(self, state) -> None:
-        """Применяет конфигурацию из state объекта."""
         def _int(name, default, lo=1):
             v = getattr(state, name, default)
             try:
@@ -791,7 +748,6 @@ class MotionMatcher:
         self._validate_overlap()
 
     def apply_config(self, cfg: dict) -> None:
-        """Применяет конфигурацию из dict."""
         def _gi(key, cur, lo=1):
             if key not in cfg:
                 return cur
@@ -816,4 +772,4 @@ class MotionMatcher:
         self.junk_ratio = _gf("junk_ratio", self.junk_ratio)
         self.k_faiss = _gi("k_faiss", self.k_faiss)
         self.sim_threshold = _gf("sim_threshold", self.sim_threshold)
-        self._validate_overlap
+        self._validate_overlap()
