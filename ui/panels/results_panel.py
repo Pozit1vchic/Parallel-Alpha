@@ -184,6 +184,7 @@ class ResultsPanel(tk.Frame):
                 on_select=self.callbacks.get(
                     "on_select", lambda _: None),
                 lang=self._lang)
+            self._list_outer.pack(fill=tk.BOTH, expand=True)
 
         # Показываем контейнер списка с fill+expand
         self._list_outer.pack(fill=tk.BOTH, expand=True)

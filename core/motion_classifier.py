@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-core/motion_classifier.py — Классификация движений для EDL (Edit Decision List).
-Новые категории: static, cut_point, action_peak, direction_LR, direction_RL, direction_FB.
-"""
+
 from __future__ import annotations
 
 import numpy as np

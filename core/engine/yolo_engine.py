@@ -1,19 +1,6 @@
-# ═══════════════════════════════════════════════════════════════════════════════
-# core/engine/yolo_engine.py — ULTRA HIGH-PERFORMANCE YOLO ENGINE
-# ═══════════════════════════════════════════════════════════════════════════════
-"""
-YoloEngine — высокопроизводительный движок детекции поз с GPU-оптимизацией.
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-КРИТИЧЕСКИЕ ОПТИМИЗАЦИИ:
-========================
-✅ torch.inference_mode() вместо no_grad()
-✅ Принудительное FP16 через model.model.half()
-✅ GPU-классификация direction на тензорах
-✅ Одна синхронизация GPU→CPU на весь батч
-✅ Векторизованный парсинг без Python-циклов
-✅ Прогрев с реальным размером батча (BATCH_SIZE_GPU)
-✅ Удалён весь мёртвый код префетчера
-"""
 from __future__ import annotations
 
 import gc
@@ -34,10 +21,6 @@ from core.engine.model_manager import (
     _safe_cb,
 )
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Константы
-# ══════════════════════════════════════════════════════════════════════════════
-
 try:
     from utils.constants import (
         YOLO_CONF               as _CONF,
@@ -49,52 +32,177 @@ except ImportError:
     _IMGSZ  = 640
     _KP_VIS = 0.30
 
-# Публичные константы (совместимость)
+# ---------------------------------------------------------------------------
+# Constants (ALL PRESERVED + additions)
+# ---------------------------------------------------------------------------
+
 DEFAULT_CONF     : float = _CONF
 IMGSZ            : int   = _IMGSZ
 KP_VIS_THRESHOLD : float = _KP_VIS
 
-# Производительность
-BATCH_SIZE_GPU : int = 96   # оптимально для RTX 5070
-BATCH_SIZE_CPU : int = 16
+BATCH_SIZE_GPU   : int   = 96
+BATCH_SIZE_CPU   : int   = 16
 
-# COCO Keypoints (уровень модуля)
 _NOSE       = 0
 _L_EAR      = 3
 _R_EAR      = 4
 _L_SHOULDER = 5
 _R_SHOULDER = 6
 
-# Пороги направления
 _ADAPTIVE_MIN = 0.06
 _ADAPTIVE_MAX = 0.15
 
+_MIN_CUDA_CC_FOR_FP16  = (7, 0)
+_WARMUP_MAX_RETRIES    = 3
+_WARMUP_BATCH_DIVIDER  = 2
+_BATCH_OOM_MIN         = 4
+_PARSE_MIN_VISIBLE_KP  = 5
 
-# ══════════════════════════════════════════════════════════════════════════════
+
+# ---------------------------------------------------------------------------
+# GPU capability check
+# ---------------------------------------------------------------------------
+
+def _supports_fp16() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        cc = torch.cuda.get_device_capability()
+        return cc >= _MIN_CUDA_CC_FOR_FP16
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# FULLY VECTORISED batch direction classifier
+# ---------------------------------------------------------------------------
+
+# Маппинг для эффективного перевода числовых меток в строки
+_DIR_LABELS: tuple[str, ...] = ("unknown", "forward", "left", "right")
+# 0=unknown, 1=forward, 2=left, 3=right
+
+
+def _classify_directions_batch(
+    kp_batch: torch.Tensor,
+    vis_thr:  float,
+) -> list[str]:
+    """
+    Полностью векторизованная классификация направления для N поз.
+    kp_batch: (N, 17, 3) — на GPU/CPU.
+
+    В исходной версии тут был Python-цикл с .item() вызовами, что
+    приводило к синхронизации GPU stream на каждой позе. Теперь весь
+    расчёт идёт батчем, и только финальный mapping в строки делается
+    одним numpy-индексированием.
+    """
+    N = kp_batch.shape[0]
+    if N == 0:
+        return []
+
+    # Работаем в float32 на исходном устройстве — без копий
+    kp = kp_batch
+    if kp.dtype != torch.float32:
+        kp = kp.float()
+
+    c_nose = kp[:, _NOSE,       2]
+    c_le   = kp[:, _L_EAR,      2]
+    c_re   = kp[:, _R_EAR,      2]
+    c_ls   = kp[:, _L_SHOULDER, 2]
+    c_rs   = kp[:, _R_SHOULDER, 2]
+
+    lsx    = kp[:, _L_SHOULDER, 0]
+    rsx    = kp[:, _R_SHOULDER, 0]
+    nose_x = kp[:, _NOSE,       0]
+    le_x   = kp[:, _L_EAR,      0]
+    re_x   = kp[:, _R_EAR,      0]
+
+    shoulder_cx = (lsx + rsx) * 0.5
+    shoulder_w  = (lsx - rsx).abs() + 1e-5
+
+    ls_ok = c_ls >= vis_thr
+    rs_ok = c_rs >= vis_thr
+    le_ok = c_le >= vis_thr
+    re_ok = c_re >= vis_thr
+    nose_ok = c_nose >= vis_thr
+    margin = vis_thr - 0.05
+
+    # Адаптивный порог
+    adaptive_thr = torch.clamp(
+        0.3 / (shoulder_w / 50.0 + 1e-5),
+        min=_ADAPTIVE_MIN, max=_ADAPTIVE_MAX,
+    )
+
+    # ---- head_x (по приоритету: nose → both ears → l_ear → r_ear) ----
+    # Если плечи невидимы и точек головы тоже нет, head_offset считается отдельно.
+    head_x = torch.where(nose_ok, nose_x,
+             torch.where(le_ok & re_ok, (le_x + re_x) * 0.5,
+             torch.where(le_ok, le_x,
+             torch.where(re_ok, re_x, shoulder_cx))))
+
+    head_offset_norm = (head_x - shoulder_cx) / shoulder_w
+
+    # Случай "нет головы вообще" — fallback по разнице конфидансов плеч
+    no_head = ~(nose_ok | le_ok | re_ok)
+    head_offset_fallback = (c_rs - c_ls) * 0.15  # абсолютный, не нормированный
+    # Но мы хотим работать в той же шкале — порог тоже подменяем для no_head:
+    # Используем |head_offset_fallback| и сравним с adaptive_thr.
+
+    # ---- финальные метки (int8) ----
+    # 0=unknown, 1=forward, 2=left, 3=right
+    labels = torch.zeros(N, dtype=torch.int8, device=kp.device)
+
+    both_shoulders_invisible = (~ls_ok) & (~rs_ok)
+
+    # Сценарий 1: плечи невидимы → решаем только по ушам
+    s1_right = both_shoulders_invisible & le_ok & (~re_ok)
+    s1_left  = both_shoulders_invisible & re_ok & (~le_ok)
+    labels = torch.where(s1_right, torch.tensor(3, dtype=torch.int8, device=kp.device), labels)
+    labels = torch.where(s1_left,  torch.tensor(2, dtype=torch.int8, device=kp.device), labels)
+
+    # Сценарий 2: одно плечо видимо, другое слабее margin
+    s2_right = (~both_shoulders_invisible) & ls_ok & (~(c_rs >= margin))
+    s2_left  = (~both_shoulders_invisible) & rs_ok & (~(c_ls >= margin)) & (~s2_right)
+    labels = torch.where(s2_right, torch.tensor(3, dtype=torch.int8, device=kp.device), labels)
+    labels = torch.where(s2_left,  torch.tensor(2, dtype=torch.int8, device=kp.device), labels)
+
+    # Сценарий 3: оба плеча видимы (или хотя бы одно достаточно видно)
+    handled = both_shoulders_invisible | s2_right | s2_left
+
+    # Под-сценарий 3a: голова видна — по нормированному offset
+    s3_has_head = (~handled) & (~no_head)
+    abs_off = head_offset_norm.abs()
+    s3_forward = s3_has_head & (abs_off < adaptive_thr)
+    s3_right   = s3_has_head & (~s3_forward) & (head_offset_norm > 0)
+    s3_left    = s3_has_head & (~s3_forward) & (head_offset_norm <= 0)
+    labels = torch.where(s3_forward, torch.tensor(1, dtype=torch.int8, device=kp.device), labels)
+    labels = torch.where(s3_right,   torch.tensor(3, dtype=torch.int8, device=kp.device), labels)
+    labels = torch.where(s3_left,    torch.tensor(2, dtype=torch.int8, device=kp.device), labels)
+
+    # Под-сценарий 3b: головы нет — fallback по конфидансам плеч
+    s3_no_head = (~handled) & no_head
+    abs_fb = head_offset_fallback.abs()
+    s3b_forward = s3_no_head & (abs_fb < adaptive_thr)
+    s3b_right   = s3_no_head & (~s3b_forward) & (head_offset_fallback > 0)
+    s3b_left    = s3_no_head & (~s3b_forward) & (head_offset_fallback <= 0)
+    labels = torch.where(s3b_forward, torch.tensor(1, dtype=torch.int8, device=kp.device), labels)
+    labels = torch.where(s3b_right,   torch.tensor(3, dtype=torch.int8, device=kp.device), labels)
+    labels = torch.where(s3b_left,    torch.tensor(2, dtype=torch.int8, device=kp.device), labels)
+
+    # Один синхронный трансфер N int8 значений → numpy → mapping
+    labels_np = labels.cpu().numpy()
+    return [_DIR_LABELS[i] for i in labels_np]
+
+
+# ---------------------------------------------------------------------------
 # YoloEngine
-# ══════════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 
 class YoloEngine:
-    """
-    Высокопроизводительная обёртка над YOLOv8/YOLO11-pose.
-
-    Ключевые оптимизации
-    --------------------
-    * torch.inference_mode() — отключение autograd
-    * FP16 через model.model.half() — вдвое меньше памяти
-    * GPU-классификация direction — без скачивания на CPU
-    * Одна синхронизация GPU→CPU на батч
-    * Векторизованная обработка без Python-циклов
-    * Прогрев батчем BATCH_SIZE_GPU
-    """
-
-    # Атрибуты класса (совместимость)
     AVAILABLE_MODELS = AVAILABLE_MODELS
     DEFAULT_CONF     = _CONF
     KP_VIS_THRESHOLD = _KP_VIS
 
     def __init__(self, device: str | None = None) -> None:
-        # Device selection
         if device is None:
             self.device: str = "cuda" if torch.cuda.is_available() else "cpu"
         elif device == "cpu":
@@ -102,19 +210,30 @@ class YoloEngine:
         else:
             self.device = device if torch.cuda.is_available() else "cpu"
 
-        self.use_fp16: bool = (self.device != "cpu")
+        self.use_fp16: bool = (self.device != "cpu") and _supports_fp16()
         self._device_str: str = self.device
 
-        # Model manager
         self._manager    = ModelManager()
         self.model       = None
         self._model_name = ""
         self._model_path = ""
         self._load_lock  = threading.Lock()
 
-    # ──────────────────────────────────────────────────────────────────────────
+        self._current_batch_size: int = (
+            BATCH_SIZE_GPU if self.device != "cpu" else BATCH_SIZE_CPU
+        )
+
+        # Кэш предкомпилированного torch device
+        self._torch_device = torch.device(self.device)
+
+        if self.device != "cpu":
+            torch.backends.cudnn.benchmark        = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32       = True
+
+    # ------------------------------------------------------------------
     # Properties
-    # ──────────────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
 
     @property
     def model_name(self) -> str:
@@ -132,9 +251,9 @@ class YoloEngine:
     def model_path(self, v: str) -> None:
         self._model_path = v
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Загрузка модели
-    # ──────────────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Load / reload
+    # ------------------------------------------------------------------
 
     def load(
         self,
@@ -145,17 +264,6 @@ class YoloEngine:
         on_source  : Optional[Callable[[bool],  None]] = None,
         force      : bool = False,
     ) -> None:
-        """
-        Загрузить модель.
-
-        Parameters
-        ----------
-        model_path  : имя или путь к весам
-        on_status   : колбэк строки статуса
-        on_progress : колбэк прогресса [0..100]
-        on_source   : колбэк флага локального источника
-        force       : перезагрузить даже если уже загружена
-        """
         if not self._load_lock.acquire(blocking=False):
             return
         try:
@@ -176,7 +284,6 @@ class YoloEngine:
         on_progress: Optional[Callable[[float], None]] = None,
         on_source  : Optional[Callable[[bool],  None]] = None,
     ) -> None:
-        """Принудительно перезагрузить модель."""
         self.load(
             model_path,
             on_status=on_status,
@@ -192,7 +299,6 @@ class YoloEngine:
         on_progress: Optional[Callable[[float], None]],
         on_source  : Optional[Callable[[bool],  None]],
     ) -> None:
-        """Внутренняя реализация загрузки."""
         try:
             local_path = self._manager.prepare(
                 name,
@@ -222,12 +328,14 @@ class YoloEngine:
 
         _safe_cb(on_progress, 80.0)
 
-        # ═══ КРИТИЧЕСКАЯ ОПТИМИЗАЦИЯ: Принудительное FP16 ═══
         if self.device != "cpu":
-            try:
-                self.model.model.half()  # Конвертация весов в FP16
-                self.use_fp16 = True
-            except Exception:
+            if _supports_fp16():
+                try:
+                    self.model.model.half()
+                    self.use_fp16 = True
+                except Exception:
+                    self.use_fp16 = False
+            else:
                 self.use_fp16 = False
         else:
             self.use_fp16 = False
@@ -245,41 +353,27 @@ class YoloEngine:
         _safe_cb(on_status, f"{name} готова.")
 
     def _release(self) -> None:
-        """Освободить память модели."""
         tmp, self.model = self.model, None
         del tmp
         gc.collect()
-        # Очистка кэша только при освобождении модели
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def _warmup(self, imgsz: int = _IMGSZ, runs: int = 3) -> None:
-        """
-        ═══ ОПТИМИЗАЦИЯ: Прогрев с реальным размером батча ═══
-        """
-        bs = BATCH_SIZE_GPU if self.device != "cpu" else BATCH_SIZE_CPU
-        dummy_single = np.zeros((imgsz, imgsz, 3), dtype=np.uint8)
-        dummy_batch  = [dummy_single] * bs
+    # ------------------------------------------------------------------
+    # Warmup
+    # ------------------------------------------------------------------
 
-        with torch.inference_mode():
-            for _ in range(runs):
-                try:
-                    self.model.predict(
-                        dummy_batch,
-                        imgsz=imgsz,
-                        verbose=False,
-                        half=self.use_fp16,
-                        conf=_CONF,
-                        stream=False,
-                        device=self.device,
-                    )
-                except RuntimeError as exc:
-                    if "out of memory" in str(exc).lower():
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        # Fallback: одиночный кадр
+    def _warmup(self, imgsz: int = IMGSZ, runs: int = 3) -> None:
+        bs = self._current_batch_size
+        dummy_single = np.zeros((imgsz, imgsz, 3), dtype=np.uint8)
+
+        for attempt in range(_WARMUP_MAX_RETRIES):
+            dummy_batch = [dummy_single] * bs
+            try:
+                with torch.inference_mode():
+                    for _ in range(runs):
                         self.model.predict(
-                            dummy_single,
+                            dummy_batch,
                             imgsz=imgsz,
                             verbose=False,
                             half=self.use_fp16,
@@ -287,57 +381,59 @@ class YoloEngine:
                             stream=False,
                             device=self.device,
                         )
-                    break
+                self._current_batch_size = bs
+                return
+            except RuntimeError as exc:
+                if "out of memory" not in str(exc).lower():
+                    return
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                bs = max(_BATCH_OOM_MIN, bs // _WARMUP_BATCH_DIVIDER)
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Инференс
-    # ──────────────────────────────────────────────────────────────────────────
+        try:
+            with torch.inference_mode():
+                self.model.predict(
+                    dummy_single,
+                    imgsz=imgsz,
+                    verbose=False,
+                    half=self.use_fp16,
+                    conf=_CONF,
+                    stream=False,
+                    device=self.device,
+                )
+            self._current_batch_size = 1
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Batch size
+    # ------------------------------------------------------------------
 
     def get_batch_size(self) -> int:
-        """Вернуть фиксированный размер батча."""
-        return BATCH_SIZE_GPU if self.device != "cpu" else BATCH_SIZE_CPU
+        return self._current_batch_size
+
+    # ------------------------------------------------------------------
+    # Detect
+    # ------------------------------------------------------------------
 
     def detect_batch(self, frames_batch: list) -> list[dict | None]:
-        """
-        Детектировать позы в батче кадров.
-
-        Parameters
-        ----------
-        frames_batch : list[np.ndarray]
-            BGR-кадры
-
-        Returns
-        -------
-        list[dict | None]
-            Каждый элемент: dict с ключами
-            ``keypoints``, ``direction``, ``confidence``,
-            ``bbox``, ``orig_w``, ``orig_h``, ``scale``, ``anchor_y``
-            либо None
-        """
         if not frames_batch:
             return []
-
         if self.model is None:
             raise RuntimeError("Модель не загружена. Вызовите load().")
-
         return self._run_batch(frames_batch)
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Внутренние методы инференса
-    # ──────────────────────────────────────────────────────────────────────────
-
     def _run_batch(self, frames: list) -> list[dict | None]:
-        """
-        ═══ ОПТИМИЗАЦИЯ: inference_mode + экспоненциальный fallback ═══
-        """
-        current_batch = frames
+        if not frames:
+            return []
+
         bs = len(frames)
 
         while bs >= 1:
             try:
                 with torch.inference_mode():
                     results = self.model.predict(
-                        current_batch,
+                        frames[:bs],
                         imgsz=_IMGSZ,
                         verbose=False,
                         half=self.use_fp16,
@@ -345,117 +441,122 @@ class YoloEngine:
                         stream=False,
                         device=self.device,
                     )
-                return self._parse_batch_results(results, len(current_batch))
+                parsed = self._parse_batch_results(results, bs)
+
+                if bs < len(frames):
+                    tail = self._run_batch(frames[bs:])
+                    parsed.extend(tail)
+
+                if bs < self._current_batch_size:
+                    self._current_batch_size = bs
+
+                return parsed
 
             except RuntimeError as exc:
                 if "out of memory" not in str(exc).lower():
                     return [None] * len(frames)
-
-                # OOM: экспоненциальное уменьшение
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                bs = bs // 2
-                if bs < 1:
+                new_bs = bs // 2
+                if new_bs < 1:
                     break
-                current_batch = frames[:bs]
+                bs = new_bs
 
-        # Абсолютный fallback
         return [self._detect_single(f) for f in frames]
 
-    def _parse_batch_results(
-        self,
-        results,
-        n: int,
-    ) -> list[dict | None]:
-        """
-        ═══ КРИТИЧЕСКАЯ ОПТИМИЗАЦИЯ: Одна синхронизация GPU→CPU ═══
-        
-        Векторизованная обработка:
-        1. Собираем все keypoints на GPU
-        2. Классифицируем direction на GPU
-        3. ОДНА синхронизация всех данных CPU
-        4. Векторизованный расчёт confidence
-        """
+    # ------------------------------------------------------------------
+    # Parse results — оптимизировано:
+    #   • один stack на все валидные позы
+    #   • один cpu().numpy() трансфер
+    #   • направления считаются ТЕМ ЖЕ stack-ом → нет лишнего копирования
+    #   • bbox считается векторно для всех поз сразу
+    # ------------------------------------------------------------------
+
+    def _parse_batch_results(self, results, n: int) -> list[dict | None]:
         if not results:
             return [None] * n
 
-        # ── Фаза 1: Сбор GPU-тензоров ─────────────────────────────────────
-        gpu_tensors : list[torch.Tensor | None] = []
-        orig_shapes : list[tuple[int, int]]     = []
-        valid_indices: list[int]                = []
+        gpu_tensors:   list[torch.Tensor | None] = [None] * n
+        orig_shapes:   list[tuple[int, int]]     = [(0, 0)] * n
+        valid_indices: list[int]                 = []
 
         for i, res in enumerate(results):
-            h, w = (res.orig_shape[0], res.orig_shape[1]) if res.orig_shape else (0, 0)
-            orig_shapes.append((h, w))
+            if res.orig_shape:
+                orig_shapes[i] = (res.orig_shape[0], res.orig_shape[1])
 
             if (
                 res.keypoints is not None
                 and res.keypoints.data is not None
                 and len(res.keypoints.data) > 0
             ):
-                kp_tensor = res.keypoints.data[0]  # (N_kp, 3) на GPU
+                kp_tensor = res.keypoints.data[0]
                 if kp_tensor.shape[0] >= 17:
-                    gpu_tensors.append(kp_tensor)
+                    gpu_tensors[i] = kp_tensor[:17]
                     valid_indices.append(i)
-                else:
-                    gpu_tensors.append(None)
-            else:
-                gpu_tensors.append(None)
 
-        # ── Фаза 2: GPU-классификация direction ───────────────────────────
-        directions_gpu: list[str] = []
-        
-        if valid_indices:
-            for idx in valid_indices:
-                kp_gpu = gpu_tensors[idx][:17]  # (17, 3) на GPU
-                direction = self._classify_direction_gpu(kp_gpu)
-                directions_gpu.append(direction)
-
-        # ── Фаза 3: ОДНА синхронизация GPU→CPU ────────────────────────────
-        kp_cpu_list   : list[np.ndarray] = []
-        confs_cpu_list: list[float]      = []
-
-        if valid_indices:
-            # Стекируем все валидные тензоры
-            try:
-                # Пытаемся стекировать (если одинаковая форма)
-                stacked = torch.stack([gpu_tensors[i][:17] for i in valid_indices])
-                # ОДНА синхронизация
-                kp_cpu_batch = stacked.cpu().numpy()  # (M, 17, 3)
-                
-                # Векторизованный расчёт confidence
-                confs_cpu_list = kp_cpu_batch[:, :, 2].mean(axis=1).tolist()
-                kp_cpu_list = list(kp_cpu_batch)
-                
-            except RuntimeError:
-                # Разные формы (редко) — обрабатываем по одному
-                for i in valid_indices:
-                    kp = gpu_tensors[i][:17].cpu().numpy()
-                    kp_cpu_list.append(kp)
-                    confs_cpu_list.append(float(kp[:, 2].mean()))
-
-        # ── Фаза 4: Построение итогового списка ───────────────────────────
         output: list[dict | None] = [None] * n
-        valid_ptr = 0
+        if not valid_indices:
+            return output
 
-        for i in range(n):
-            if gpu_tensors[i] is None:
+        # ── Один stack для всех валидных поз ──────────────────────────
+        try:
+            stacked_gpu = torch.stack([gpu_tensors[i] for i in valid_indices])  # (M, 17, 3)
+        except RuntimeError:
+            # fallback — возможна разная форма
+            for idx in valid_indices:
+                kp = gpu_tensors[idx].cpu().numpy()
+                d = self._classify_direction_gpu(gpu_tensors[idx])
+                conf = float(kp[:, 2].mean())
+                h, w = orig_shapes[idx]
+                output[idx] = self._parse_single_result(kp, h, w, conf, d)
+            return output
+
+        # ── Направления — векторно ────────────────────────────────────
+        try:
+            dirs = _classify_directions_batch(stacked_gpu, KP_VIS_THRESHOLD)
+        except Exception:
+            dirs = [self._classify_direction_gpu(stacked_gpu[j]) for j in range(len(valid_indices))]
+
+        # ── Один трансфер на CPU ──────────────────────────────────────
+        cpu_batch = stacked_gpu.cpu().numpy()  # (M, 17, 3)
+
+        # Векторный расчёт средних confidence
+        confs = cpu_batch[:, :, 2].mean(axis=1)  # (M,)
+
+        # ── Векторно строим словари ───────────────────────────────────
+        # vis-маска для всех поз сразу
+        vis_mask_all = cpu_batch[:, :, 2] >= KP_VIS_THRESHOLD       # (M, 17)
+        n_visible_all = vis_mask_all.sum(axis=1)                    # (M,)
+
+        for j, idx in enumerate(valid_indices):
+            kp = cpu_batch[j]
+            n_vis = int(n_visible_all[j])
+            if n_vis < _PARSE_MIN_VISIBLE_KP:
                 continue
 
-            kp        = kp_cpu_list[valid_ptr]
-            conf      = confs_cpu_list[valid_ptr]
-            direction = directions_gpu[valid_ptr]
-            orig_h, orig_w = orig_shapes[i]
-            valid_ptr += 1
+            vis_mask = vis_mask_all[j]
+            visible_xy = kp[vis_mask, :2]
+            min_xy = visible_xy.min(axis=0)
+            max_xy = visible_xy.max(axis=0)
 
-            output[i] = self._parse_single_result(
-                kp, orig_h, orig_w, conf, direction
-            )
+            orig_h, orig_w = orig_shapes[idx]
+            output[idx] = {
+                "keypoints" : kp,
+                "confidence": float(confs[j]),
+                "bbox"      : [
+                    float(min_xy[0]), float(min_xy[1]),
+                    float(max_xy[0]), float(max_xy[1]),
+                ],
+                "direction" : dirs[j],
+                "orig_w"    : int(orig_w),
+                "orig_h"    : int(orig_h),
+                "scale"     : 1.0,
+                "anchor_y"  : 0.0,
+            }
 
         return output
 
     def _detect_single(self, frame) -> dict | None:
-        """CPU fallback при OOM."""
         if not isinstance(frame, np.ndarray):
             return None
         try:
@@ -464,7 +565,7 @@ class YoloEngine:
                     frame,
                     imgsz=_IMGSZ,
                     verbose=False,
-                    half=False,  # FP32 для безопасности
+                    half=self.use_fp16,
                     conf=_CONF,
                     stream=False,
                     device=self.device,
@@ -472,11 +573,11 @@ class YoloEngine:
             if results and results[0].keypoints is not None:
                 res = results[0]
                 if len(res.keypoints.data) > 0:
-                    kp_gpu = res.keypoints.data[0][:17]
+                    kp_gpu    = res.keypoints.data[0][:17]
                     direction = self._classify_direction_gpu(kp_gpu)
-                    kp = kp_gpu.cpu().numpy()
-                    h, w = res.orig_shape
-                    conf = float(kp[:, 2].mean())
+                    kp        = kp_gpu.cpu().numpy()
+                    h, w      = res.orig_shape
+                    conf      = float(kp[:, 2].mean())
                     return self._parse_single_result(kp, h, w, conf, direction)
         except Exception:
             pass
@@ -490,24 +591,17 @@ class YoloEngine:
         conf     : float,
         direction: str,
     ) -> dict | None:
-        """
-        Разобрать массив keypoints → dict.
-        Direction уже вычислен на GPU.
-        """
         if kp is None or kp.shape[0] < 17:
             return None
 
-        # Фильтр: нужно ≥5 видимых точек
-        vis_mask = kp[:, 2] >= self.KP_VIS_THRESHOLD
-        if vis_mask.sum() < 5:
+        vis_mask = kp[:, 2] >= KP_VIS_THRESHOLD
+        if vis_mask.sum() < _PARSE_MIN_VISIBLE_KP:
             return None
 
         visible = kp[vis_mask]
-
-        # bbox (векторизованно)
-        min_xy = visible[:, :2].min(axis=0)
-        max_xy = visible[:, :2].max(axis=0)
-        bbox   = [
+        min_xy  = visible[:, :2].min(axis=0)
+        max_xy  = visible[:, :2].max(axis=0)
+        bbox    = [
             float(min_xy[0]), float(min_xy[1]),
             float(max_xy[0]), float(max_xy[1]),
         ]
@@ -523,101 +617,25 @@ class YoloEngine:
             "anchor_y"  : 0.0,
         }
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # GPU-классификация направления
-    # ──────────────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Direction (single, GPU) — fallback
+    # ------------------------------------------------------------------
 
     def _classify_direction_gpu(self, kp17_gpu: torch.Tensor) -> str:
-        """
-        ═══ КРИТИЧЕСКАЯ ОПТИМИЗАЦИЯ: Классификация на GPU-тензорах ═══
-        
-        Вся логика выполняется на GPU без скачивания данных на CPU.
-        
-        Parameters
-        ----------
-        kp17_gpu : torch.Tensor
-            (17, 3) тензор на GPU: [x, y, confidence]
-        
-        Returns
-        -------
-        str : "forward" | "left" | "right" | "unknown"
-        """
-        VIS = self.KP_VIS_THRESHOLD
-        
-        # Извлекаем confidence для нужных точек (остаётся на GPU)
-        c_nose = kp17_gpu[_NOSE, 2]
-        c_le   = kp17_gpu[_L_EAR, 2]
-        c_re   = kp17_gpu[_R_EAR, 2]
-        c_ls   = kp17_gpu[_L_SHOULDER, 2]
-        c_rs   = kp17_gpu[_R_SHOULDER, 2]
+        # Используем батчевую функцию с N=1 — DRY и стабильно
+        if kp17_gpu.dim() == 2:
+            kp17_gpu = kp17_gpu.unsqueeze(0)
+        return _classify_directions_batch(kp17_gpu, KP_VIS_THRESHOLD)[0]
 
-        # ── Шаг 1: оба плеча невидимы ──────────────────────────────────────
-        if c_ls < VIS and c_rs < VIS:
-            if c_le >= VIS and c_re < VIS:
-                return "right"
-            if c_re >= VIS and c_le < VIS:
-                return "left"
-            return "unknown"
-
-        # ── Шаг 2: только одно плечо видно ─────────────────────────────────
-        margin = VIS - 0.05
-        if c_ls >= VIS and c_rs < margin:
-            return "right"
-        if c_rs >= VIS and c_ls < margin:
-            return "left"
-
-        # ── Шаг 3: оба плеча видны → вычисляем head_offset ────────────────
-        lsx = kp17_gpu[_L_SHOULDER, 0]
-        rsx = kp17_gpu[_R_SHOULDER, 0]
-        
-        shoulder_cx = (lsx + rsx) * 0.5
-        shoulder_w  = torch.abs(lsx - rsx) + 1e-5
-
-        # Определяем позицию головы
-        if c_nose >= VIS:
-            head_x = kp17_gpu[_NOSE, 0]
-        elif c_le >= VIS and c_re >= VIS:
-            head_x = (kp17_gpu[_L_EAR, 0] + kp17_gpu[_R_EAR, 0]) * 0.5
-        elif c_le >= VIS:
-            head_x = kp17_gpu[_L_EAR, 0]
-        elif c_re >= VIS:
-            head_x = kp17_gpu[_R_EAR, 0]
-        else:
-            # Нет головных точек → используем разность confidence
-            head_offset = float((c_rs - c_ls).item()) * 0.15
-            adaptive_thr = max(
-                _ADAPTIVE_MIN,
-                min(_ADAPTIVE_MAX, 0.3 / (float(shoulder_w.item()) / 50.0 + 1e-5)),
-            )
-            if abs(head_offset) < adaptive_thr:
-                return "forward"
-            return "right" if head_offset > 0 else "left"
-
-        head_offset  = (head_x - shoulder_cx) / shoulder_w
-        adaptive_thr = max(
-            _ADAPTIVE_MIN,
-            min(_ADAPTIVE_MAX, 0.3 / (float(shoulder_w.item()) / 50.0 + 1e-5)),
-        )
-
-        # Финальное решение (скачиваем только одно float-значение)
-        offset_val = float(head_offset.item())
-        
-        if abs(offset_val) < adaptive_thr:
-            return "forward"
-        return "right" if offset_val > 0 else "left"
-
-    # Публичный алиас (совместимость)
     def classify_direction(self, kp17: np.ndarray) -> str:
-        """CPU-версия для обратной совместимости."""
         kp_gpu = torch.from_numpy(kp17).float().to(self.device)
         return self._classify_direction_gpu(kp_gpu)
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Info / Utils
-    # ──────────────────────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Info / utils
+    # ------------------------------------------------------------------
 
     def get_model_info(self) -> dict:
-        """Вернуть метаданные текущей модели."""
         return {
             "name"       : self._model_name,
             "path"       : self._model_path,
@@ -635,24 +653,14 @@ class YoloEngine:
             "avg_fps"    : 0.0,
             "frame_cache": 0,
             "dir_cache"  : 0,
+            "batch_size" : self._current_batch_size,
+            "fp16_supported": _supports_fp16(),
         }
 
     def list_local_models(self) -> list[str]:
-        """Список локально доступных моделей."""
         return self._manager.list_local()
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Warmup видео
-    # ──────────────────────────────────────────────────────────────────────────
-
     def warmup_video(self, video_path: str, frames_count: int = 100) -> float:
-        """
-        Предпрогрев модели на первых N кадрах реального видео.
-
-        Returns
-        -------
-        float : время прогрева в секундах, -1.0 при ошибке
-        """
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             return -1.0
@@ -672,7 +680,7 @@ class YoloEngine:
         bs = self.get_batch_size()
 
         for i in range(0, len(frames), bs):
-            batch = frames[i : i + bs]
+            batch = frames[i: i + bs]
             if not batch:
                 break
             try:
@@ -682,10 +690,5 @@ class YoloEngine:
 
         return time.perf_counter() - t0
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Cleanup
-    # ──────────────────────────────────────────────────────────────────────────
-
     def cleanup(self) -> None:
-        """Освободить все ресурсы."""
         self._release()

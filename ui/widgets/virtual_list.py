@@ -151,6 +151,7 @@ class VirtualResultsList(SmoothScrollMixin):
     # ── Внутреннее ────────────────────────────────────────────────────────
 
     def _refresh(self) -> None:
+        self._canvas.update_idletasks()
         self._update_scrollregion()
         self._render()
 
@@ -256,6 +257,8 @@ class VirtualResultsList(SmoothScrollMixin):
     def _render(self) -> None:
         print(f"[VList] _render: filtered={len(self._filtered)}, cw={self._canvas.winfo_width()}, ch={self._canvas.winfo_height()}")
         c = self.colors
+
+        self._canvas.update_idletasks()
 
         cw = max(self._canvas.winfo_width(), 1)
         ch = max(self._canvas.winfo_height(), 1)
